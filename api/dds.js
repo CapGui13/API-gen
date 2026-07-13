@@ -20,9 +20,10 @@ require('./dds-lib.js');
 
 const calcDDTable = global.Module.cwrap('generateDDTable', 'string', ['string']);
 
-// À restreindre à ton domaine GitHub Pages une fois en prod (au lieu de '*'),
-// ex: 'https://capgui13.github.io'
-const ALLOWED_ORIGIN = '*';
+// Restreint aux appels venant de ton générateur (capgui13.github.io héberge plusieurs
+// sous-dossiers, ex. /gen/ — mais l'en-tête Origin envoyé par le navigateur ne contient
+// jamais le chemin, seulement le domaine, donc pas de /gen/ ici).
+const ALLOWED_ORIGIN = 'https://capgui13.github.io';
 
 module.exports = async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
