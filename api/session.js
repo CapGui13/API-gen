@@ -58,6 +58,12 @@ module.exports = async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // Voir échange avec Guillaume ("A a récupéré une version périmée") : sans ça, rien
+    // n'empêche le navigateur (ou un cache intermédiaire) de réutiliser une ancienne
+    // réponse à cette même URL — exactement ce qui a dû se produire après plusieurs tests
+    // manuels de cette URL dans des onglets pendant le débogage. Cette route change à
+    // chaque enchère, elle ne doit jamais être mise en cache.
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     if (req.method === 'OPTIONS') {
         res.status(204).end();
         return;
