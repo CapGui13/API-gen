@@ -1,8 +1,10 @@
 // api/session.js — Persistance cloud de l'état de partie, pour les sessions "asynchrones"
 // (deux joueurs qui enchérissent chacun à son rythme, jamais forcément connectés en même
-// temps). Backé par Upstash Redis (API REST générique, un simple fetch — aucune dépendance
-// npm requise), à l'identique de ce que fait déjà saveHostGameStateToStorage() côté client
-// avec localStorage, mais accessible depuis N'IMPORTE QUEL appareil.
+// temps), ET désormais aussi comme relais de secours en mode live par siège déconnecté
+// (voir ARCHITECTURE-P2P-SERVEUR.md côté repo `play`). Backé par Upstash Redis (API REST
+// générique, un simple fetch — aucune dépendance npm requise), à l'identique de ce que
+// fait déjà saveHostGameStateToStorage() côté client avec localStorage, mais accessible
+// depuis N'IMPORTE QUEL appareil.
 //
 // Variables d'environnement attendues (Vercel → Settings → Environment Variables) :
 //   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN
@@ -15,16 +17,29 @@
 //
 // `expectedVersion` (optionnel) sert de verrou optimiste : si quelqu'un d'autre a écrit
 // entre-temps, la réponse 409 renvoie l'état courant (`current`) pour que le client
-// recharge et réapplique plutôt que d'écraser à l'aveugle. En pratique, avec un seul
-// joueur actif à la fois par construction, ce cas doit rester rare — mais coûte peu à
-// sécuriser.
+// recharge et réapplique plutôt que d'écraser à l'aveugle.
 //
-// Voir échange avec Guillaume ("j'aimerais que ce soit quasi instantané") : chaque écriture
-// réussie diffuse aussi un petit événement Pusher sur le canal de la salle, pour que
-// l'autre appareil soit prévenu EN DIRECT plutôt que d'attendre son prochain sondage
-// périodique (voir pollCloudForUpdates côté client, qui reste un filet de secours au cas
-// où cet événement se perdrait). L'événement ne transporte que le numéro de version — le
-// client relit l'état complet via GET (déjà anti-cache), jamais dupliqué ici.
+// Voir échange avec Guillaume ("j'aimerais que ce soit quasi instantané" / "pourrait-on
+// améliorer la latence ?") : deux changements par rapport à la version précédente.
+//
+// 1) pusherTrigger est maintenant ATTENDU (await) avant de répondre au client — sans ça,
+//    l'exécution de la fonction pouvait être coupée par le runtime Vercel dès que sa
+//    propre promesse se résolvait, avant que cet appel fire-and-forget n'ait eu le temps
+//    de vraiment partir : la notification "temps réel" se perdait alors silencieusement
+//    (le sondage de secours côté client rattrape toujours le coup, mais avec un délai
+//    bien plus grand que prévu — jusqu'à DEFERRED_POLL_INTERVAL_MS, pas juste "manqué de
+//    peu"). Léger coût : celui qui écrit attend un peu plus longtemps sa propre réponse
+//    (le temps de cet appel Pusher), mais la fiabilité de la notification aux AUTRES
+//    prime ici sur ce petit surcoût pour l'auteur de l'écriture.
+//
+// 2) L'événement Pusher embarque maintenant l'état LUI-MÊME (pas seulement le numéro de
+//    version) quand il est assez petit pour tenir dans la limite de Pusher (10 Ko par
+//    événement, voir PUSHER_EVENT_MAX_BYTES) — le client applique alors directement,
+//    sans repasser par un second aller-retour GET (voir applyCloudUpdate côté app.js,
+//    déjà prêt à recevoir ceci directement). Au-delà de cette taille (session avec
+//    beaucoup de donnes chargées), on retombe sur l'ancien comportement (version seule,
+//    le client relit via GET) — c'est déjà ce qu'il sait faire, aucun changement requis
+//    côté client pour ce cas de repli.
 
 const crypto = require('crypto');
 
@@ -40,6 +55,11 @@ const PUSHER_CLUSTER = process.env.PUSHER_CLUSTER;
 // club, pas un tournoi permanent), et on repousse ce délai à chaque écriture (voir SET ...
 // EX ci-dessous), donc une partie active ne s'éteint jamais toute seule en cours de route.
 const TTL_SECONDS = 60 * 60 * 24 * 60;
+
+// Marge sous la vraie limite Pusher (10 Ko par événement, corps entier compris) — voir
+// point 2) du commentaire d'en-tête. Comparée à la taille de l'événement FINAL (avec son
+// enveloppe JSON), pas seulement à l'état brut.
+const PUSHER_EVENT_MAX_BYTES = 9000;
 
 function keyFor(code) {
     return `bridge-session:${String(code || '').toUpperCase().trim()}`;
@@ -69,9 +89,9 @@ async function redisCommand(command) {
 
 // Implémente à la main la signature REST de Pusher (HMAC-SHA256 + MD5 du corps), telle que
 // documentée par Pusher — évite la dépendance npm "pusher" pour un besoin aussi ponctuel
-// qu'un simple trigger. Toujours en tâche de fond (fire-and-forget, voir l'appelant) : un
-// échec ici ne doit jamais faire échouer l'écriture elle-même, le sondage de secours
-// prendra le relais.
+// qu'un simple trigger. Désormais ATTENDUE par l'appelant (voir commentaire d'en-tête,
+// point 1) — plus un simple fire-and-forget : un échec ici est intercepté par l'appelant,
+// jamais laissé remonter et casser la réponse HTTP déjà en cours de construction.
 async function pusherTrigger(channel, eventName, data) {
     if (!PUSHER_APP_ID || !PUSHER_KEY || !PUSHER_SECRET || !PUSHER_CLUSTER) return; // pas encore configuré : no-op silencieux
 
@@ -158,11 +178,28 @@ module.exports = async (req, res) => {
 
             const payload = { version: currentVersion + 1, updatedAt: Date.now(), state };
             await redisCommand(['SET', keyFor(code), JSON.stringify(payload), 'EX', String(TTL_SECONDS)]);
+
+            // Voir commentaire d'en-tête, point 2 : embarque l'état complet si l'événement
+            // final tient sous PUSHER_EVENT_MAX_BYTES, sinon repli sur la version seule
+            // (le client relit alors via GET, comportement inchangé pour ce cas-là).
+            const fullEventPayload = { version: payload.version, updatedAt: payload.updatedAt, state: payload.state };
+            const versionOnlyPayload = { version: payload.version, updatedAt: payload.updatedAt };
+            const eventPayload = JSON.stringify(fullEventPayload).length <= PUSHER_EVENT_MAX_BYTES
+                ? fullEventPayload
+                : versionOnlyPayload;
+
+            // Voir commentaire d'en-tête, point 1 : attendu maintenant, mais toujours
+            // encapsulé dans son propre try/catch — un échec Pusher (pas encore
+            // configuré, panne passagère) ne doit jamais faire échouer l'écriture
+            // elle-même, qui a déjà réussi dans Redis à ce stade.
+            try {
+                await pusherTrigger(channelFor(code), 'update', eventPayload);
+            } catch (e) {
+                // Tant pis pour cette notification en direct — le sondage de secours
+                // côté client la rattrapera.
+            }
+
             res.status(200).json({ version: payload.version, updatedAt: payload.updatedAt });
-            // Fire-and-forget, APRÈS avoir répondu au client : ne fait jamais attendre
-            // l'appelant, et un échec ici (Pusher pas encore configuré, panne passagère)
-            // n'affecte jamais le succès de l'écriture elle-même.
-            pusherTrigger(channelFor(code), 'update', { version: payload.version, updatedAt: payload.updatedAt }).catch(() => {});
         } catch (e) {
             res.status(500).json({ error: String((e && e.message) || e) });
         }
