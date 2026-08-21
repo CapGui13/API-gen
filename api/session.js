@@ -29,6 +29,7 @@
 
 const crypto = require('crypto');
 const { isDeepStrictEqual } = require('util');
+const { advanceRobotAuction, isRobotSeat } = require('./pons-server');
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -402,9 +403,11 @@ function cloneJson(v) { return JSON.parse(JSON.stringify(v)); }
 // Construit un état restreint à partir du snapshot SERVEUR. Toute tentative de modifier
 // mains, identité de l'hôte, sièges d'autrui, historique humain d'autrui, etc. est ignorée
 // ou rejetée. Les seules mutations permises sont : profil propre, claim d'un siège PENDING,
-// chat propre, annonces de ses propres sièges (et appels robot légaux sur sièges vides),
-// ainsi que son undo différé selon la règle déjà appliquée dans le client.
-function buildRestrictedParticipantState(current, proposed, actorId) {
+// chat propre, annonces de ses propres sièges, ainsi que son undo différé selon la règle
+// déjà appliquée dans le client. Les appels robot ne sont PLUS acceptés depuis le snapshot
+// participant : à la première frontière robot, le suffixe client est ignoré et PONS est
+// exécuté côté serveur sur le snapshot autoritaire.
+async function buildRestrictedParticipantState(current, proposed, actorId) {
     if (!current || !proposed || typeof current !== 'object' || typeof proposed !== 'object') throw new Error('participant-state-invalid');
     if (String(proposed.roomCode || '') !== String(current.roomCode || '')) throw new Error('participant-room-change-forbidden');
     if (!Array.isArray(current.deals) || !Array.isArray(proposed.deals) || current.deals.length !== proposed.deals.length) throw new Error('participant-deals-shape-forbidden');
@@ -475,17 +478,21 @@ function buildRestrictedParticipantState(current, proposed, actorId) {
         if (arrayPrefix(curHist, propHist)) {
             const merged = cloneJson(curHist);
             for (const entry of propHist.slice(curHist.length)) {
-                if (!entry || !SEATS.includes(entry.seat) || typeof entry.call !== 'string') throw new Error('participant-call-invalid');
                 const expectedSeat = currentTurnSeatServer(curDeal.dealer, merged);
+                const occupant = next.seatAssignment[expectedSeat];
+
+                // Frontière P2 architecturale : un client participant n'a plus AUCUNE
+                // autorité sur la valeur d'une annonce robot. Même si son suffixe contient
+                // une annonce parfaitement légale, on cesse ici de consommer le suffixe.
+                // Le bloc d'auto-avancement ci-dessous demandera à PONS SERVEUR de choisir
+                // l'annonce à partir de l'historique serveur exact.
+                if (isRobotSeat(next.seatAssignment, expectedSeat)) break;
+
+                if (!entry || !SEATS.includes(entry.seat) || typeof entry.call !== 'string') throw new Error('participant-call-invalid');
                 if (entry.seat !== expectedSeat || !isServerCallLegal(merged, entry.call, entry.seat)) throw new Error('participant-call-illegal');
-                const occupant = next.seatAssignment[entry.seat];
-                const actorOwns = occupant === actorId;
-                const robotSeat = occupant == null || occupant === '';
-                if (!actorOwns && !robotSeat) throw new Error('participant-call-other-human-forbidden');
-                if (actorOwns) {
-                    if (actorChangedBoard != null && actorChangedBoard !== i) throw new Error('participant-call-multiple-boards');
-                    actorChangedBoard = i;
-                }
+                if (occupant !== actorId) throw new Error('participant-call-other-human-forbidden');
+                if (actorChangedBoard != null && actorChangedBoard !== i) throw new Error('participant-call-multiple-boards');
+                actorChangedBoard = i;
                 merged.push({ seat: entry.seat, call: String(entry.call).toUpperCase(), ...(typeof entry.explanation === 'string' ? { explanation: entry.explanation.slice(0, 500) } : {}) });
             }
             next.deals[i].auctionHistory = merged;
@@ -504,6 +511,35 @@ function buildRestrictedParticipantState(current, proposed, actorId) {
             continue;
         }
         throw new Error('participant-auction-rewrite-forbidden');
+    }
+
+    // Si le tour autoritaire de la donne partagée appartient maintenant à un robot, PONS
+    // est exécuté ICI, côté serveur. Cela couvre à la fois :
+    // - l'annonce humaine relayée qui vient de donner la main à un robot ;
+    // - un ancien client qui a inclus une annonce robot dans son suffixe (valeur ignorée) ;
+    // - une reprise différée qui envoie un snapshot inchangé uniquement pour demander de
+    //   faire progresser le tour robot.
+    // Un participant doit être réellement assis, et on n'auto-avance pas une seconde donne
+    // si ce même PUT a déjà modifié une autre donne.
+    const sharedBoardIndex = Number.isInteger(current.boardIndex) ? current.boardIndex : -1;
+    const actorIsSeated = actorSeats(next, actorId).length > 0;
+    if (actorIsSeated && sharedBoardIndex >= 0 && next.deals[sharedBoardIndex]
+        && (actorChangedBoard == null || actorChangedBoard === sharedBoardIndex)) {
+        const sharedDeal = next.deals[sharedBoardIndex];
+        const sharedHistory = Array.isArray(sharedDeal.auctionHistory) ? sharedDeal.auctionHistory : [];
+        const expectedSeat = currentTurnSeatServer(sharedDeal.dealer, sharedHistory);
+        if (expectedSeat && isRobotSeat(next.seatAssignment, expectedSeat) && !isAuctionOverServer(sharedHistory)) {
+            const advanced = await advanceRobotAuction({
+                deal: sharedDeal,
+                history: sharedHistory,
+                seatAssignment: next.seatAssignment,
+                currentTurnSeat: currentTurnSeatServer,
+                isCallLegal: isServerCallLegal,
+                isAuctionOver: isAuctionOverServer,
+                maxCalls: 64
+            });
+            next.deals[sharedBoardIndex].auctionHistory = advanced.history;
+        }
     }
 
     // Navigation reste locale pour un participant : seul le host peut changer la donne
@@ -742,8 +778,13 @@ module.exports = async (req, res) => {
                 }
                 let restrictedState;
                 try {
-                    restrictedState = buildRestrictedParticipantState(currentPayload.state, state, actor.participantId);
+                    restrictedState = await buildRestrictedParticipantState(currentPayload.state, state, actor.participantId);
                 } catch (e) {
+                    if (e && e.serverPonsFault) {
+                        console.error('[session] autorité PONS serveur indisponible :', e.code || e.message, e.cause || '');
+                        res.status(503).json({ error: e.code || 'server-pons-unavailable' });
+                        return;
+                    }
                     res.status(403).json({ error: String((e && e.message) || 'participant-write-forbidden') });
                     return;
                 }
