@@ -46,6 +46,9 @@ const ROOM_CODE_RESERVATION_TTL_SECONDS = 120;
 // un code pendant 60 jours si la partie est abandonnée avant le premier snapshot.
 const PRESESSION_ACCESS_TTL_SECONDS = 6 * 60 * 60;
 const ROOM_CODE_ALLOCATION_ATTEMPTS = 64;
+const RESERVE_RATE_WINDOW_SECONDS = 60;
+const RESERVE_RATE_PER_CLIENT = 20;
+const RESERVE_RATE_GLOBAL = 300;
 const ACCESS_KEY_BYTES = 32;
 const ACCESS_KEY_HEADER = 'x-bridge-session-key';
 const HOST_WRITE_KEY_HEADER = 'x-bridge-host-write-key';
@@ -78,6 +81,20 @@ function hostWriteKeyFor(code) {
 }
 function participantAuthKeyFor(code, participantId) {
     return `bridge-session-participant-auth:${String(code || '').toUpperCase().trim()}:${participantId}`;
+}
+
+function reserveRateSubject(req) {
+    const forwarded = requestHeader(req, 'x-forwarded-for');
+    const realIp = requestHeader(req, 'x-real-ip');
+    const ip = String((forwarded && forwarded.split(',')[0]) || realIp || 'unknown').trim().slice(0, 128);
+    const origin = String((req && req.headers && req.headers.origin) || 'no-origin').trim().slice(0, 256);
+    return crypto.createHash('sha256').update(`${ip}|${origin}`, 'utf8').digest('hex').slice(0, 32);
+}
+function reserveRateKeyFor(req) {
+    return `bridge-reserve-rate:${reserveRateSubject(req)}`;
+}
+function reserveGlobalRateKey() {
+    return 'bridge-reserve-rate:global';
 }
 function channelFor(code) {
     return `private-session-${String(code || '').toUpperCase().trim()}`;
@@ -395,8 +412,14 @@ function sanitizeName(v, fallback = 'Joueur') {
     const x = typeof v === 'string' ? v.trim().slice(0, 40) : '';
     return x || fallback;
 }
+const AVATAR_COLOR_PALETTE = new Set([
+    '#FF0000','#0000FF','#00FF00','#8A2BE2','#FF7F50','#5F9EA0','#D2691E','#1E90FF',
+    '#B22222','#DAA520','#FF69B4','#FF4500','#2E8B57','#00FF7F','#9ACD32'
+]);
 function sanitizeAvatar(v) {
-    return typeof v === 'string' && /^#[0-9A-Fa-f]{6}$/.test(v) ? v.toUpperCase() : null;
+    if (typeof v !== 'string') return null;
+    const color = v.toUpperCase();
+    return AVATAR_COLOR_PALETTE.has(color) ? color : null;
 }
 function cloneJson(v) { return JSON.parse(JSON.stringify(v)); }
 
@@ -419,15 +442,24 @@ async function buildRestrictedParticipantState(current, proposed, actorId) {
     let actor = next.participants.find(p => p && p.id === actorId);
     if (!actor) {
         actor = { id: actorId, name: sanitizeName(proposedActor && proposedActor.name) };
-        const color = sanitizeAvatar(proposedActor && proposedActor.avatarColor);
-        if (color) actor.avatarColor = color;
+        if (proposedActor && proposedActor.avatarColor != null) {
+            const color = sanitizeAvatar(proposedActor.avatarColor);
+            if (!color) throw new Error('participant-avatar-invalid');
+            actor.avatarColor = color;
+        }
         actor.disconnected = false;
         actor.disconnectedAt = null;
         next.participants.push(actor);
     } else if (proposedActor) {
         actor.name = sanitizeName(proposedActor.name, actor.name || 'Joueur');
-        const color = sanitizeAvatar(proposedActor.avatarColor);
-        if (color) actor.avatarColor = color; else delete actor.avatarColor;
+        if (Object.prototype.hasOwnProperty.call(proposedActor, 'avatarColor')) {
+            if (proposedActor.avatarColor == null || proposedActor.avatarColor === '') delete actor.avatarColor;
+            else {
+                const color = sanitizeAvatar(proposedActor.avatarColor);
+                if (!color) throw new Error('participant-avatar-invalid');
+                actor.avatarColor = color;
+            }
+        }
         actor.disconnected = false;
         actor.disconnectedAt = null;
     }
@@ -457,7 +489,7 @@ async function buildRestrictedParticipantState(current, proposed, actorId) {
         if (!m || m.senderId !== actorId || typeof m.text !== 'string') throw new Error('participant-chat-impersonation');
         const text = m.text.trim().slice(0, 500);
         if (!text) continue;
-        next.chatMessages.push({ senderId: actorId, senderName: actorForName ? actorForName.name : 'Joueur', text });
+        next.chatMessages.push({ type: 'chat', senderId: actorId, senderName: actorForName ? actorForName.name : 'Joueur', text });
     }
 
     let actorChangedBoard = null;
@@ -547,6 +579,28 @@ async function buildRestrictedParticipantState(current, proposed, actorId) {
     // a réellement changé l'état ; un simple snapshot arbitraire rejeté devient un no-op.
     if (!isDeepStrictEqual(next, current)) next.savedAt = Date.now();
     return next;
+}
+
+const RESERVE_RATE_LUA = `
+local clientCount = redis.call('INCR', KEYS[1])
+if clientCount == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+if clientCount > tonumber(ARGV[2]) then return {-1, clientCount, 0} end
+local globalCount = redis.call('INCR', KEYS[2])
+if globalCount == 1 then redis.call('EXPIRE', KEYS[2], ARGV[1]) end
+if globalCount > tonumber(ARGV[3]) then return {-2, clientCount, globalCount} end
+return {1, clientCount, globalCount}
+`;
+async function enforceReserveRateLimit(req) {
+    const result = await redisCommand([
+        'EVAL', RESERVE_RATE_LUA, '2', reserveRateKeyFor(req), reserveGlobalRateKey(),
+        String(RESERVE_RATE_WINDOW_SECONDS), String(RESERVE_RATE_PER_CLIENT), String(RESERVE_RATE_GLOBAL)
+    ]);
+    const code = Array.isArray(result) ? Number(result[0]) : Number(result);
+    return {
+        allowed: code === 1,
+        reason: code === -1 ? 'client' : (code === -2 ? 'global' : null),
+        retryAfter: RESERVE_RATE_WINDOW_SECONDS
+    };
 }
 
 // Allocation atomique : une salle neuve reçoit DEUX secrets distincts : capacité de
@@ -654,6 +708,12 @@ module.exports = async (req, res) => {
         }
         if (body && body.action === 'reserve-code') {
             try {
+                const rate = await enforceReserveRateLimit(req);
+                if (!rate.allowed) {
+                    res.setHeader('Retry-After', String(rate.retryAfter));
+                    res.status(429).json({ error: 'reserve-code-rate-limited', scope: rate.reason, retryAfterSeconds: rate.retryAfter });
+                    return;
+                }
                 const reserved = await reserveFreshRoomCode();
                 res.status(201).json({
                     code: reserved.code,
