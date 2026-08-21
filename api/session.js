@@ -1,10 +1,11 @@
 // api/session.js — Persistance cloud sécurisée de l'état de partie.
 //
 // Sécurité : un code de salle 4 chiffres reste un identifiant humain, PAS un secret.
-// Chaque salle possède désormais une clé de capacité aléatoire (32 octets) générée lors
-// de la réservation. Cette clé n'est jamais stockée dans le snapshot de partie ; elle est
-// transmise uniquement au navigateur légitime (réservation initiale, lien d'invitation,
-// ou P2P) et exigée sur chaque GET/PUT. La migration non authentifiée `claim-legacy`
+// Chaque salle possède une capacité de lecture/relais ET une capacité d'écriture host
+// distincte, toutes deux aléatoires (32 octets), générées lors de la réservation. Aucun
+// secret n'est stocké dans le snapshot ni dans le lien court. La capacité host reste sur
+// l'appareil hôte ; les joueurs assis reçoivent seulement la capacité lecture/relais par
+// P2P ciblé après enregistrement de leur preuve privée de reconnexion. `claim-legacy`
 // est désactivée : un identifiant présent dans un snapshot n'est jamais une preuve d'accès.
 //
 // Variables d'environnement :
@@ -14,17 +15,20 @@
 //
 // Routes :
 //   POST /api/session body { action:'reserve-code' }
-//        -> { code, accessKey, reservationTtlSeconds }
+//        -> { code, accessKey, hostWriteKey, reservationTtlSeconds }
 //   GET  /api/session?code=XXXX + X-Bridge-Session-Key
 //        -> { version, updatedAt, state } | 404
 //   PUT  /api/session?code=XXXX + X-Bridge-Session-Key
-//        body { state, expectedVersion } -> { version, updatedAt } | 409 { current }
+//        + X-Bridge-Host-Write-Key : snapshot complet host
+//        OU + identité/reconnect-secret participant : mutation serveur restreinte
+//        body { state, expectedVersion } -> { version, updatedAt[, state] } | 409 { current }
 //
 // Le verrou expectedVersion reste atomique : authentification de la clé, comparaison de
 // version, écriture de l'état, promotion de la réservation en clé durable et refresh des
 // TTL sont exécutés dans UNE SEULE commande Redis EVAL.
 
 const crypto = require('crypto');
+const { isDeepStrictEqual } = require('util');
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -43,6 +47,13 @@ const PRESESSION_ACCESS_TTL_SECONDS = 6 * 60 * 60;
 const ROOM_CODE_ALLOCATION_ATTEMPTS = 64;
 const ACCESS_KEY_BYTES = 32;
 const ACCESS_KEY_HEADER = 'x-bridge-session-key';
+const HOST_WRITE_KEY_HEADER = 'x-bridge-host-write-key';
+const PARTICIPANT_ID_HEADER = 'x-bridge-participant-id';
+const RECONNECT_SECRET_HEADER = 'x-bridge-reconnect-secret';
+const MODERN_GUEST_ID_RE = /^p_[A-Za-z0-9_-]{24,96}$/;
+const RECONNECT_SECRET_RE = /^s_[A-Za-z0-9_-]{32,160}$/;
+const SEATS = ['N', 'E', 'S', 'W'];
+const SEAT_PENDING = 'PENDING';
 
 const DEFAULT_ALLOWED_ORIGINS = ['https://capgui13.github.io'];
 const EXTRA_ALLOWED_ORIGINS = String(process.env.BRIDGE_ALLOWED_ORIGINS || '')
@@ -57,6 +68,15 @@ function reservationKeyFor(code) {
 }
 function accessKeyFor(code) {
     return `bridge-session-access:${String(code || '').toUpperCase().trim()}`;
+}
+function writeReservationKeyFor(code) {
+    return `bridge-room-write-reservation:${String(code || '').toUpperCase().trim()}`;
+}
+function hostWriteKeyFor(code) {
+    return `bridge-session-host-write:${String(code || '').toUpperCase().trim()}`;
+}
+function participantAuthKeyFor(code, participantId) {
+    return `bridge-session-participant-auth:${String(code || '').toUpperCase().trim()}:${participantId}`;
 }
 function channelFor(code) {
     return `private-session-${String(code || '').toUpperCase().trim()}`;
@@ -76,9 +96,16 @@ function safeTextEqual(a, b) {
     const bb = Buffer.from(b, 'utf8');
     return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
-function requestAccessKey(req) {
-    const raw = req && req.headers && (req.headers[ACCESS_KEY_HEADER] || req.headers[ACCESS_KEY_HEADER.toLowerCase()]);
+function requestHeader(req, name) {
+    const raw = req && req.headers && (req.headers[name] || req.headers[name.toLowerCase()]);
     return typeof raw === 'string' ? raw.trim() : '';
+}
+function requestAccessKey(req) { return requestHeader(req, ACCESS_KEY_HEADER); }
+function requestHostWriteKey(req) { return requestHeader(req, HOST_WRITE_KEY_HEADER); }
+function requestParticipantId(req) { return requestHeader(req, PARTICIPANT_ID_HEADER); }
+function requestReconnectSecret(req) { return requestHeader(req, RECONNECT_SECRET_HEADER); }
+function hashReconnectSecret(secret) {
+    return crypto.createHash('sha256').update(String(secret || ''), 'utf8').digest('hex');
 }
 
 function isAllowedOrigin(origin) {
@@ -92,7 +119,7 @@ function applyCors(req, res) {
     if (origin && isAllowedOrigin(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Session-Key');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Bridge-Session-Key, X-Bridge-Host-Write-Key, X-Bridge-Participant-Id, X-Bridge-Reconnect-Secret');
     res.setHeader('Access-Control-Max-Age', '600');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     return isAllowedOrigin(origin);
@@ -119,6 +146,56 @@ async function readStoredAccessKey(code) {
     return reserved ? String(reserved) : null;
 }
 
+async function readStoredHostWriteKey(code) {
+    const durable = await redisCommand(['GET', hostWriteKeyFor(code)]);
+    if (durable) return String(durable);
+    const reserved = await redisCommand(['GET', writeReservationKeyFor(code)]);
+    return reserved ? String(reserved) : null;
+}
+
+async function authorizeHostWriteRequest(req, res, code) {
+    const accessKey = requestAccessKey(req);
+    const writeKey = requestHostWriteKey(req);
+    if (!accessKey || !writeKey) {
+        res.status(401).json({ error: 'session-host-write-required' });
+        return false;
+    }
+    const [storedAccess, storedWrite] = await Promise.all([
+        readStoredAccessKey(code), readStoredHostWriteKey(code)
+    ]);
+    if (!storedAccess || !storedWrite || !safeTextEqual(storedAccess, accessKey) || !safeTextEqual(storedWrite, writeKey)) {
+        res.status(403).json({ error: 'session-host-write-invalid' });
+        return false;
+    }
+    return true;
+}
+
+async function authorizeParticipantWrite(req, res, code) {
+    const accessKey = requestAccessKey(req);
+    const participantId = requestParticipantId(req);
+    const reconnectSecret = requestReconnectSecret(req);
+    if (!accessKey) {
+        res.status(401).json({ error: 'session-auth-required' });
+        return null;
+    }
+    const storedAccess = await readStoredAccessKey(code);
+    if (!storedAccess || !safeTextEqual(storedAccess, accessKey)) {
+        res.status(403).json({ error: 'session-auth-invalid' });
+        return null;
+    }
+    if (!MODERN_GUEST_ID_RE.test(participantId) || !RECONNECT_SECRET_RE.test(reconnectSecret)) {
+        res.status(403).json({ error: 'participant-auth-invalid' });
+        return null;
+    }
+    const storedHash = await redisCommand(['GET', participantAuthKeyFor(code, participantId)]);
+    const presentedHash = hashReconnectSecret(reconnectSecret);
+    if (!storedHash || !safeTextEqual(String(storedHash), presentedHash)) {
+        res.status(403).json({ error: 'participant-auth-invalid' });
+        return null;
+    }
+    return { participantId };
+}
+
 async function authorizeReadRequest(req, res, code) {
     const provided = requestAccessKey(req);
     if (!provided) {
@@ -133,124 +210,357 @@ async function authorizeReadRequest(req, res, code) {
     return true;
 }
 
-// Le script valide aussi la clé d'accès. Pour une nouvelle salle, la clé courte de
-// réservation est promue atomiquement en clé durable lors du tout premier PUT.
+// Le PUT complet est réservé au host courant. Deux secrets distincts sont requis :
+// la capacité de lecture de salle ET une capacité d'écriture host qui n'est jamais
+// transmise aux invités. Les deux réservations sont promues atomiquement au premier PUT.
 const SESSION_CAS_LUA = `
 local raw = redis.call('GET', KEYS[1])
-local durableKey = redis.call('GET', KEYS[3])
-local reservationKey = redis.call('GET', KEYS[2])
-local providedKey = ARGV[5]
+local durableAccess = redis.call('GET', KEYS[3])
+local reservedAccess = redis.call('GET', KEYS[2])
+local durableWrite = redis.call('GET', KEYS[5])
+local reservedWrite = redis.call('GET', KEYS[4])
+local providedAccess = ARGV[5]
+local providedWrite = ARGV[6]
 
 if raw then
-  if not durableKey or durableKey ~= providedKey then
-    return {-2, ''}
-  end
+  if not durableAccess or durableAccess ~= providedAccess then return {-2, ''} end
+  if not durableWrite or durableWrite ~= providedWrite then return {-3, ''} end
 else
-  if durableKey then
-    if durableKey ~= providedKey then return {-2, ''} end
+  if durableAccess then
+    if durableAccess ~= providedAccess then return {-2, ''} end
   else
-    if not reservationKey or reservationKey ~= providedKey then return {-2, ''} end
-    redis.call('SET', KEYS[3], providedKey, 'EX', ARGV[4])
+    if not reservedAccess or reservedAccess ~= providedAccess then return {-2, ''} end
+    redis.call('SET', KEYS[3], providedAccess, 'EX', ARGV[4])
+  end
+  if durableWrite then
+    if durableWrite ~= providedWrite then return {-3, ''} end
+  else
+    if not reservedWrite or reservedWrite ~= providedWrite then return {-3, ''} end
+    redis.call('SET', KEYS[5], providedWrite, 'EX', ARGV[4])
   end
 end
 
 local currentVersion = 0
 if raw then
   local ok, decoded = pcall(cjson.decode, raw)
-  if not ok or type(decoded) ~= 'table' or type(decoded.version) ~= 'number' then
-    return {-1, raw}
-  end
+  if not ok or type(decoded) ~= 'table' or type(decoded.version) ~= 'number' then return {-1, raw} end
   currentVersion = decoded.version
 end
-
 local expectedVersion = tonumber(ARGV[1])
-if expectedVersion ~= currentVersion then
-  return {0, raw or ''}
-end
+if expectedVersion ~= currentVersion then return {0, raw or ''} end
 
 local newVersion = currentVersion + 1
 local updatedAt = ARGV[2]
 local stateJson = ARGV[3]
 local ttl = ARGV[4]
 local payload = '{"version":' .. tostring(newVersion)
-  .. ',"updatedAt":' .. updatedAt
-  .. ',"state":' .. stateJson .. '}'
+  .. ',"updatedAt":' .. updatedAt .. ',"state":' .. stateJson .. '}'
 redis.call('SET', KEYS[1], payload, 'EX', ttl)
-redis.call('SET', KEYS[3], providedKey, 'EX', ttl)
+redis.call('SET', KEYS[3], providedAccess, 'EX', ttl)
+redis.call('SET', KEYS[5], providedWrite, 'EX', ttl)
 redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[4])
 return {1, tostring(newVersion), updatedAt, payload}
 `;
 
-async function atomicWriteSession(code, state, expectedVersion, updatedAt, accessKey) {
+async function atomicWriteSession(code, state, expectedVersion, updatedAt, accessKey, hostWriteKey) {
     const stateJson = JSON.stringify(state);
     const result = await redisCommand([
-        'EVAL', SESSION_CAS_LUA, '3', keyFor(code), reservationKeyFor(code), accessKeyFor(code),
-        String(expectedVersion), String(updatedAt), stateJson, String(TTL_SECONDS), accessKey
+        'EVAL', SESSION_CAS_LUA, '5', keyFor(code), reservationKeyFor(code), accessKeyFor(code),
+        writeReservationKeyFor(code), hostWriteKeyFor(code),
+        String(expectedVersion), String(updatedAt), stateJson, String(TTL_SECONDS), accessKey, hostWriteKey
     ]);
     if (!Array.isArray(result) || result.length === 0) throw new Error('Réponse Redis CAS invalide.');
     const status = Number(result[0]);
     if (status === -2) return { unauthorized: true };
+    if (status === -3) return { hostUnauthorized: true };
     if (status === -1) throw new Error('État de session Redis corrompu : version illisible.');
     if (status === 0) {
         let current = null;
-        if (result[1]) {
-            try { current = JSON.parse(result[1]); }
-            catch (e) { throw new Error('État de session Redis corrompu : JSON illisible.'); }
-        }
+        if (result[1]) current = JSON.parse(result[1]);
         return { conflict: true, current };
     }
     if (status !== 1) throw new Error(`Statut Redis CAS inattendu: ${status}`);
-    let payload;
-    try { payload = JSON.parse(result[3]); }
-    catch (e) { throw new Error('Payload Redis CAS invalide.'); }
-    return { conflict: false, payload };
+    return { conflict: false, payload: JSON.parse(result[3]) };
 }
 
-// Allocation atomique : aucune ancienne session, aucune clé durable et aucune autre
-// réservation ne doivent exister. La valeur de réservation EST la clé de capacité.
-const ROOM_CODE_RESERVE_LUA = `
-if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
-redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
-return 1
+// Écriture restreinte d'un participant authentifié. Le serveur construit lui-même le
+// prochain snapshot ; ce script ne fait ensuite que le CAS version + capacité de salle.
+const PARTICIPANT_CAS_LUA = `
+local raw = redis.call('GET', KEYS[1])
+local durableAccess = redis.call('GET', KEYS[2])
+if not durableAccess or durableAccess ~= ARGV[5] then return {-2, raw or ''} end
+if not raw then return {-4, ''} end
+local ok, decoded = pcall(cjson.decode, raw)
+if not ok or type(decoded) ~= 'table' or type(decoded.version) ~= 'number' then return {-1, raw} end
+if tonumber(ARGV[1]) ~= decoded.version then return {0, raw} end
+local newVersion = decoded.version + 1
+local payload = '{"version":' .. tostring(newVersion)
+  .. ',"updatedAt":' .. ARGV[2] .. ',"state":' .. ARGV[3] .. '}'
+redis.call('SET', KEYS[1], payload, 'EX', ARGV[4])
+redis.call('EXPIRE', KEYS[2], ARGV[4])
+if redis.call('EXISTS', KEYS[3]) == 1 then redis.call('EXPIRE', KEYS[3], ARGV[4]) end
+return {1, tostring(newVersion), ARGV[2], payload}
 `;
 
+async function atomicParticipantWriteSession(code, state, expectedVersion, updatedAt, accessKey) {
+    const result = await redisCommand([
+        'EVAL', PARTICIPANT_CAS_LUA, '3', keyFor(code), accessKeyFor(code), hostWriteKeyFor(code),
+        String(expectedVersion), String(updatedAt), JSON.stringify(state), String(TTL_SECONDS), accessKey
+    ]);
+    if (!Array.isArray(result) || result.length === 0) throw new Error('Réponse Redis participant CAS invalide.');
+    const status = Number(result[0]);
+    if (status === -2) return { unauthorized: true };
+    if (status === -4) return { missing: true };
+    if (status === -1) throw new Error('État de session Redis corrompu : version illisible.');
+    if (status === 0) return { conflict: true, current: result[1] ? JSON.parse(result[1]) : null };
+    if (status !== 1) throw new Error(`Statut Redis participant CAS inattendu: ${status}`);
+    return { conflict: false, payload: JSON.parse(result[3]) };
+}
+
+function partnershipOf(seat) { return seat === 'N' || seat === 'S' ? 'NS' : 'EW'; }
+function currentTurnSeatServer(dealer, history) {
+    const start = SEATS.indexOf(String(dealer || '').toUpperCase());
+    if (start < 0) return null;
+    return SEATS[(start + (Array.isArray(history) ? history.length : 0)) % 4];
+}
+function parseContractCall(call) {
+    const m = /^([1-7])(C|D|H|S|NT)$/.exec(String(call || '').toUpperCase());
+    if (!m) return null;
+    const order = { C: 0, D: 1, H: 2, S: 3, NT: 4 };
+    return { level: Number(m[1]), strain: m[2], rank: (Number(m[1]) - 1) * 5 + order[m[2]] };
+}
+function isAuctionOverServer(history) {
+    if (!Array.isArray(history) || history.length < 4) return false;
+    const tail3 = history.slice(-3).every(e => String(e.call || '').toUpperCase() === 'PASS');
+    if (!tail3) return false;
+    const anyContract = history.some(e => !!parseContractCall(e.call));
+    if (anyContract) return true;
+    return history.length >= 4 && history.slice(-4).every(e => String(e.call || '').toUpperCase() === 'PASS');
+}
+function lastNonPass(history) {
+    for (let i = history.length - 1; i >= 0; i--) if (String(history[i].call).toUpperCase() !== 'PASS') return { ...history[i], index: i };
+    return null;
+}
+function lastContract(history) {
+    for (let i = history.length - 1; i >= 0; i--) {
+        const bid = parseContractCall(history[i].call);
+        if (bid) return { ...history[i], bid, index: i };
+    }
+    return null;
+}
+function isServerCallLegal(history, call, seat) {
+    call = String(call || '').toUpperCase();
+    if (isAuctionOverServer(history)) return false;
+    if (call === 'PASS') return true;
+    const bid = parseContractCall(call);
+    if (bid) {
+        const prev = lastContract(history);
+        return !prev || bid.rank > prev.bid.rank;
+    }
+    const nonPass = lastNonPass(history);
+    if (call === 'X') {
+        if (!nonPass || !parseContractCall(nonPass.call)) return false;
+        return partnershipOf(nonPass.seat) !== partnershipOf(seat);
+    }
+    if (call === 'XX') {
+        if (!nonPass || String(nonPass.call).toUpperCase() !== 'X') return false;
+        const contract = lastContract(history);
+        return !!contract && partnershipOf(contract.seat) === partnershipOf(seat);
+    }
+    return false;
+}
+function arrayPrefix(prefix, full) {
+    return Array.isArray(prefix) && Array.isArray(full) && prefix.length <= full.length
+        && prefix.every((v, i) => isDeepStrictEqual(v, full[i]));
+}
+function actorSeats(state, actorId) {
+    return SEATS.filter(seat => state.seatAssignment && state.seatAssignment[seat] === actorId);
+}
+function findActorUndoTarget(state, actorId, history) {
+    const seats = actorSeats(state, actorId);
+    for (let i = history.length - 1; i >= 0; i--) if (seats.includes(history[i].seat)) return i;
+    return -1;
+}
+function findPartnerLastCall(state, actorId, history) {
+    const mine = actorSeats(state, actorId);
+    if (!mine.length) return -1;
+    const camps = new Set(mine.map(partnershipOf));
+    const partners = SEATS.filter(s => camps.has(partnershipOf(s)) && !mine.includes(s));
+    for (let i = history.length - 1; i >= 0; i--) if (partners.includes(history[i].seat)) return i;
+    return -1;
+}
+function sanitizeName(v, fallback = 'Joueur') {
+    const x = typeof v === 'string' ? v.trim().slice(0, 40) : '';
+    return x || fallback;
+}
+function sanitizeAvatar(v) {
+    return typeof v === 'string' && /^#[0-9A-Fa-f]{6}$/.test(v) ? v.toUpperCase() : null;
+}
+function cloneJson(v) { return JSON.parse(JSON.stringify(v)); }
+
+// Construit un état restreint à partir du snapshot SERVEUR. Toute tentative de modifier
+// mains, identité de l'hôte, sièges d'autrui, historique humain d'autrui, etc. est ignorée
+// ou rejetée. Les seules mutations permises sont : profil propre, claim d'un siège PENDING,
+// chat propre, annonces de ses propres sièges (et appels robot légaux sur sièges vides),
+// ainsi que son undo différé selon la règle déjà appliquée dans le client.
+function buildRestrictedParticipantState(current, proposed, actorId) {
+    if (!current || !proposed || typeof current !== 'object' || typeof proposed !== 'object') throw new Error('participant-state-invalid');
+    if (String(proposed.roomCode || '') !== String(current.roomCode || '')) throw new Error('participant-room-change-forbidden');
+    if (!Array.isArray(current.deals) || !Array.isArray(proposed.deals) || current.deals.length !== proposed.deals.length) throw new Error('participant-deals-shape-forbidden');
+
+    const next = cloneJson(current);
+    const currentParticipants = Array.isArray(current.participants) ? current.participants : [];
+    const proposedParticipants = Array.isArray(proposed.participants) ? proposed.participants : [];
+    const proposedActor = proposedParticipants.find(p => p && p.id === actorId);
+    let actor = next.participants.find(p => p && p.id === actorId);
+    if (!actor) {
+        actor = { id: actorId, name: sanitizeName(proposedActor && proposedActor.name) };
+        const color = sanitizeAvatar(proposedActor && proposedActor.avatarColor);
+        if (color) actor.avatarColor = color;
+        actor.disconnected = false;
+        actor.disconnectedAt = null;
+        next.participants.push(actor);
+    } else if (proposedActor) {
+        actor.name = sanitizeName(proposedActor.name, actor.name || 'Joueur');
+        const color = sanitizeAvatar(proposedActor.avatarColor);
+        if (color) actor.avatarColor = color; else delete actor.avatarColor;
+        actor.disconnected = false;
+        actor.disconnectedAt = null;
+    }
+
+    // Claim : uniquement un siège explicitement PENDING, et uniquement si l'acteur n'a
+    // encore aucun siège. Jamais de déplacement/remplacement d'un autre participant.
+    const mineBefore = actorSeats(current, actorId);
+    if (mineBefore.length === 0 && proposed.seatAssignment && typeof proposed.seatAssignment === 'object') {
+        const requested = SEATS.filter(seat => proposed.seatAssignment[seat] === actorId && current.seatAssignment[seat] !== actorId);
+        if (requested.length > 1) throw new Error('participant-seat-claim-too-wide');
+        if (requested.length === 1) {
+            const seat = requested[0];
+            if (current.seatAssignment[seat] !== SEAT_PENDING) throw new Error('participant-seat-claim-forbidden');
+            next.seatAssignment[seat] = actorId;
+        }
+    }
+
+    // Chat : préfixe serveur immuable ; uniquement ajout de messages de l'acteur.
+    const curChat = Array.isArray(current.chatMessages) ? current.chatMessages : [];
+    const propChat = Array.isArray(proposed.chatMessages) ? proposed.chatMessages : [];
+    if (!arrayPrefix(curChat, propChat)) throw new Error('participant-chat-rewrite-forbidden');
+    const actorForName = next.participants.find(p => p.id === actorId);
+    const extraChat = propChat.slice(curChat.length);
+    if (extraChat.length > 8) throw new Error('participant-chat-batch-too-large');
+    next.chatMessages = cloneJson(curChat);
+    for (const m of extraChat) {
+        if (!m || m.senderId !== actorId || typeof m.text !== 'string') throw new Error('participant-chat-impersonation');
+        const text = m.text.trim().slice(0, 500);
+        if (!text) continue;
+        next.chatMessages.push({ senderId: actorId, senderName: actorForName ? actorForName.name : 'Joueur', text });
+    }
+
+    let actorChangedBoard = null;
+    for (let i = 0; i < current.deals.length; i++) {
+        const curDeal = current.deals[i];
+        const propDeal = proposed.deals[i];
+        if (!curDeal || !propDeal) throw new Error('participant-deal-missing');
+        const curNoHist = { ...curDeal }; delete curNoHist.auctionHistory;
+        const propNoHist = { ...propDeal }; delete propNoHist.auctionHistory;
+        if (!isDeepStrictEqual(curNoHist, propNoHist)) throw new Error('participant-deal-content-forbidden');
+        const curHist = Array.isArray(curDeal.auctionHistory) ? curDeal.auctionHistory : [];
+        const propHist = Array.isArray(propDeal.auctionHistory) ? propDeal.auctionHistory : [];
+        if (isDeepStrictEqual(curHist, propHist)) continue;
+        if (actorSeats(current, actorId).length === 0 && !SEATS.some(seat => next.seatAssignment[seat] === actorId)) {
+            throw new Error('participant-auction-kibbitz-forbidden');
+        }
+
+        if (arrayPrefix(curHist, propHist)) {
+            const merged = cloneJson(curHist);
+            for (const entry of propHist.slice(curHist.length)) {
+                if (!entry || !SEATS.includes(entry.seat) || typeof entry.call !== 'string') throw new Error('participant-call-invalid');
+                const expectedSeat = currentTurnSeatServer(curDeal.dealer, merged);
+                if (entry.seat !== expectedSeat || !isServerCallLegal(merged, entry.call, entry.seat)) throw new Error('participant-call-illegal');
+                const occupant = next.seatAssignment[entry.seat];
+                const actorOwns = occupant === actorId;
+                const robotSeat = occupant == null || occupant === '';
+                if (!actorOwns && !robotSeat) throw new Error('participant-call-other-human-forbidden');
+                if (actorOwns) {
+                    if (actorChangedBoard != null && actorChangedBoard !== i) throw new Error('participant-call-multiple-boards');
+                    actorChangedBoard = i;
+                }
+                merged.push({ seat: entry.seat, call: String(entry.call).toUpperCase(), ...(typeof entry.explanation === 'string' ? { explanation: entry.explanation.slice(0, 500) } : {}) });
+            }
+            next.deals[i].auctionHistory = merged;
+            continue;
+        }
+
+        // Undo : le nouvel historique doit être un préfixe exact et couper juste AVANT
+        // la dernière annonce de l'acteur, sans qu'un partenaire ait annoncé depuis.
+        if (arrayPrefix(propHist, curHist)) {
+            const target = findActorUndoTarget(current, actorId, curHist);
+            const partner = findPartnerLastCall(current, actorId, curHist);
+            if (target < 0 || target <= partner || propHist.length !== target) throw new Error('participant-undo-forbidden');
+            if (actorChangedBoard != null && actorChangedBoard !== i) throw new Error('participant-undo-multiple-boards');
+            actorChangedBoard = i;
+            next.deals[i].auctionHistory = cloneJson(propHist);
+            continue;
+        }
+        throw new Error('participant-auction-rewrite-forbidden');
+    }
+
+    // Navigation reste locale pour un participant : seul le host peut changer la donne
+    // partagée qui sera reprise à froid. Ne touche savedAt que si une mutation autorisée
+    // a réellement changé l'état ; un simple snapshot arbitraire rejeté devient un no-op.
+    if (!isDeepStrictEqual(next, current)) next.savedAt = Date.now();
+    return next;
+}
+
+// Allocation atomique : une salle neuve reçoit DEUX secrets distincts : capacité de
+// lecture/relais (partagée avec les joueurs autorisés) et capacité d'écriture host (jamais
+// partagée). Aucun ancien état/réservation ne doit exister pour le code.
+const ROOM_CODE_RESERVE_LUA = `
+for i=1,5 do if redis.call('EXISTS', KEYS[i]) == 1 then return 0 end end
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[3])
+redis.call('SET', KEYS[4], ARGV[2], 'EX', ARGV[3])
+return 1
+`;
 async function reserveFreshRoomCode() {
     for (let i = 0; i < ROOM_CODE_ALLOCATION_ATTEMPTS; i++) {
         const code = String(crypto.randomInt(0, 10000)).padStart(4, '0');
         const accessKey = generateAccessKey();
+        const hostWriteKey = generateAccessKey();
         const result = await redisCommand([
-            'EVAL', ROOM_CODE_RESERVE_LUA, '3', keyFor(code), reservationKeyFor(code), accessKeyFor(code),
-            accessKey, String(ROOM_CODE_RESERVATION_TTL_SECONDS)
+            'EVAL', ROOM_CODE_RESERVE_LUA, '5', keyFor(code), reservationKeyFor(code), accessKeyFor(code),
+            writeReservationKeyFor(code), hostWriteKeyFor(code),
+            accessKey, hostWriteKey, String(ROOM_CODE_RESERVATION_TTL_SECONDS)
         ]);
-        if (Number(result) === 1) return { code, accessKey };
+        if (Number(result) === 1) return { code, accessKey, hostWriteKey };
     }
     throw new Error('Impossible de réserver un code de salle libre après plusieurs tentatives.');
 }
 
-
 const ACTIVATE_ROOM_LUA = `
 local rawSession = redis.call('GET', KEYS[1])
-local durable = redis.call('GET', KEYS[3])
-local reservation = redis.call('GET', KEYS[2])
-local provided = ARGV[1]
-if durable then
-  if durable ~= provided then return 0 end
-  if rawSession then redis.call('EXPIRE', KEYS[3], ARGV[3])
-  else redis.call('EXPIRE', KEYS[3], ARGV[2]) end
-  return 1
-end
-if not reservation or reservation ~= provided then return 0 end
-redis.call('SET', KEYS[3], provided, 'EX', ARGV[2])
+local durableAccess = redis.call('GET', KEYS[3])
+local reservedAccess = redis.call('GET', KEYS[2])
+local durableWrite = redis.call('GET', KEYS[5])
+local reservedWrite = redis.call('GET', KEYS[4])
+local providedAccess = ARGV[1]
+local providedWrite = ARGV[2]
+if durableAccess then if durableAccess ~= providedAccess then return 0 end
+else if not reservedAccess or reservedAccess ~= providedAccess then return 0 end end
+if durableWrite then if durableWrite ~= providedWrite then return 0 end
+else if not reservedWrite or reservedWrite ~= providedWrite then return 0 end end
+local ttl = rawSession and ARGV[4] or ARGV[3]
+redis.call('SET', KEYS[3], providedAccess, 'EX', ttl)
+redis.call('SET', KEYS[5], providedWrite, 'EX', ttl)
 redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[4])
 return 1
 `;
-
-async function activateRoomAccess(code, providedKey) {
+async function activateRoomAccess(code, providedAccess, providedWrite) {
     const result = await redisCommand([
-        'EVAL', ACTIVATE_ROOM_LUA, '3', keyFor(code), reservationKeyFor(code), accessKeyFor(code),
-        providedKey, String(PRESESSION_ACCESS_TTL_SECONDS), String(TTL_SECONDS)
+        'EVAL', ACTIVATE_ROOM_LUA, '5', keyFor(code), reservationKeyFor(code), accessKeyFor(code),
+        writeReservationKeyFor(code), hostWriteKeyFor(code),
+        providedAccess, providedWrite, String(PRESESSION_ACCESS_TTL_SECONDS), String(TTL_SECONDS)
     ]);
     return Number(result) === 1;
 }
@@ -312,6 +622,7 @@ module.exports = async (req, res) => {
                 res.status(201).json({
                     code: reserved.code,
                     accessKey: reserved.accessKey,
+                    hostWriteKey: reserved.hostWriteKey,
                     reservationTtlSeconds: ROOM_CODE_RESERVATION_TTL_SECONDS
                 });
             } catch (e) {
@@ -322,13 +633,31 @@ module.exports = async (req, res) => {
         if (body && body.action === 'activate-room') {
             const code = normalizeCode(body.code);
             const providedKey = requestAccessKey(req);
-            if (!validCode(code) || !providedKey) {
+            const providedWriteKey = requestHostWriteKey(req);
+            if (!validCode(code) || !providedKey || !providedWriteKey) {
                 res.status(400).json({ error: 'Paramètres activation invalides.' });
                 return;
             }
             try {
-                const ok = await activateRoomAccess(code, providedKey);
+                const ok = await activateRoomAccess(code, providedKey, providedWriteKey);
                 if (!ok) { res.status(403).json({ error: 'session-auth-invalid' }); return; }
+                res.status(200).json({ ok: true });
+            } catch (e) {
+                res.status(500).json({ error: String((e && e.message) || e) });
+            }
+            return;
+        }
+        if (body && body.action === 'register-participant') {
+            const code = normalizeCode(body.code);
+            const participantId = typeof body.participantId === 'string' ? body.participantId.trim() : '';
+            const reconnectSecret = typeof body.reconnectSecret === 'string' ? body.reconnectSecret.trim() : '';
+            if (!validCode(code) || !MODERN_GUEST_ID_RE.test(participantId) || !RECONNECT_SECRET_RE.test(reconnectSecret)) {
+                res.status(400).json({ error: 'participant-registration-invalid' });
+                return;
+            }
+            try {
+                if (!await authorizeHostWriteRequest(req, res, code)) return;
+                await redisCommand(['SET', participantAuthKeyFor(code, participantId), hashReconnectSecret(reconnectSecret), 'EX', String(TTL_SECONDS)]);
                 res.status(200).json({ ok: true });
             } catch (e) {
                 res.status(500).json({ error: String((e && e.message) || e) });
@@ -385,15 +714,54 @@ module.exports = async (req, res) => {
             res.status(413).json({ error: 'session-state-too-large', maxBytes: MAX_SESSION_STATE_BYTES, actualBytes: stateBytes });
             return;
         }
-        const providedKey = requestAccessKey(req);
-        if (!providedKey) {
+        const providedAccess = requestAccessKey(req);
+        if (!providedAccess) {
             res.status(401).json({ error: 'session-auth-required' });
             return;
         }
         try {
-            const write = await atomicWriteSession(code, state, expectedVersion, Date.now(), providedKey);
+            const providedHostWrite = requestHostWriteKey(req);
+            let write;
+            let restricted = false;
+            if (providedHostWrite) {
+                write = await atomicWriteSession(code, state, expectedVersion, Date.now(), providedAccess, providedHostWrite);
+                if (write.hostUnauthorized) {
+                    res.status(403).json({ error: 'session-host-write-invalid' });
+                    return;
+                }
+            } else {
+                const actor = await authorizeParticipantWrite(req, res, code);
+                if (!actor) return;
+                const raw = await redisCommand(['GET', keyFor(code)]);
+                if (!raw) { res.status(404).json({ error: 'Aucune session trouvée pour ce code.' }); return; }
+                const currentPayload = JSON.parse(raw);
+                if (!Number.isInteger(currentPayload.version) || !currentPayload.state) throw new Error('État de session Redis corrompu.');
+                if (currentPayload.version !== expectedVersion) {
+                    res.status(409).json({ error: 'version-conflict', current: currentPayload });
+                    return;
+                }
+                let restrictedState;
+                try {
+                    restrictedState = buildRestrictedParticipantState(currentPayload.state, state, actor.participantId);
+                } catch (e) {
+                    res.status(403).json({ error: String((e && e.message) || 'participant-write-forbidden') });
+                    return;
+                }
+                // Si toutes les différences proposées étaient hors autorité de l'acteur,
+                // ne crée même pas une nouvelle version : renvoie l'état serveur exact.
+                if (isDeepStrictEqual(restrictedState, currentPayload.state)) {
+                    res.status(200).json({ version: currentPayload.version, updatedAt: currentPayload.updatedAt, state: currentPayload.state, restricted: true, noChange: true });
+                    return;
+                }
+                write = await atomicParticipantWriteSession(code, restrictedState, expectedVersion, Date.now(), providedAccess);
+                restricted = true;
+            }
             if (write.unauthorized) {
                 res.status(403).json({ error: 'session-auth-invalid' });
+                return;
+            }
+            if (write.missing) {
+                res.status(404).json({ error: 'Aucune session trouvée pour ce code.' });
                 return;
             }
             if (write.conflict) {
@@ -406,7 +774,7 @@ module.exports = async (req, res) => {
             } catch (e) {
                 console.warn('[session] notification Pusher échouée :', String((e && e.message) || e));
             }
-            res.status(200).json({ version: payload.version, updatedAt: payload.updatedAt });
+            res.status(200).json({ version: payload.version, updatedAt: payload.updatedAt, ...(restricted ? { state: payload.state, restricted: true } : {}) });
         } catch (e) {
             res.status(500).json({ error: String((e && e.message) || e) });
         }
