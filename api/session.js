@@ -29,7 +29,7 @@
 
 const crypto = require('crypto');
 const { isDeepStrictEqual } = require('util');
-const { advanceRobotAuction, isRobotSeat } = require('./pons-server');
+const { advanceRobotAuction, isRobotSeat } = require('../lib/pons-server');
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
