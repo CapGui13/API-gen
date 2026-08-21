@@ -34,7 +34,10 @@ function isAllowedOrigin(origin) {
 }
 function applyCors(req, res) {
     const origin = req && req.headers && req.headers.origin;
-    if (origin && isAllowedOrigin(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+    if (origin && isAllowedOrigin(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Timing-Allow-Origin', origin);
+    }
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -153,7 +156,9 @@ module.exports = async function handler(req, res) {
     }
 
     try {
+        const startedAt = Date.now();
         const reserved = await reserveWithRateLimit(req);
+        res.setHeader('Server-Timing', `reserve;dur=${Math.max(0, Date.now() - startedAt)}`);
         if (reserved.rateLimited) {
             res.setHeader('Retry-After', String(RESERVE_RATE_WINDOW_SECONDS));
             res.status(429).json({
