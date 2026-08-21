@@ -4,8 +4,8 @@
 // Chaque salle possède désormais une clé de capacité aléatoire (32 octets) générée lors
 // de la réservation. Cette clé n'est jamais stockée dans le snapshot de partie ; elle est
 // transmise uniquement au navigateur légitime (réservation initiale, lien d'invitation,
-// ou P2P) et exigée sur chaque GET/PUT. Les anciennes sessions peuvent être revendiquées
-// une fois par un participant déjà connu via son reconnectToken (action claim-legacy).
+// ou P2P) et exigée sur chaque GET/PUT. La migration non authentifiée `claim-legacy`
+// est désactivée : un identifiant présent dans un snapshot n'est jamais une preuve d'accès.
 //
 // Variables d'environnement :
 //   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN
@@ -15,8 +15,6 @@
 // Routes :
 //   POST /api/session body { action:'reserve-code' }
 //        -> { code, accessKey, reservationTtlSeconds }
-//   POST /api/session body { action:'claim-legacy', code, reconnectToken }
-//        -> { code, accessKey }
 //   GET  /api/session?code=XXXX + X-Bridge-Session-Key
 //        -> { version, updatedAt, state } | 404
 //   PUT  /api/session?code=XXXX + X-Bridge-Session-Key
@@ -257,56 +255,8 @@ async function activateRoomAccess(code, providedKey) {
     return Number(result) === 1;
 }
 
-// Migration des sessions créées avant l'existence des clés de capacité. Un participant
-// déjà connu prouve sa légitimité avec son reconnectToken local. Le serveur vérifie ce
-// jeton DANS l'état Redis sans jamais renvoyer l'état au demandeur non authentifié. Tous
-// les participants légitimes d'une même ancienne salle récupèrent la même clé si l'un
-// d'eux l'a déjà revendiquée.
-const CLAIM_LEGACY_LUA = `
-local raw = redis.call('GET', KEYS[1])
-if not raw then return {-1, ''} end
-local ok, payload = pcall(cjson.decode, raw)
-if not ok or type(payload) ~= 'table' or type(payload.state) ~= 'table' then return {-2, ''} end
-local st = payload.state
-local token = ARGV[1]
-local allowed = false
-if st.roomCreatorToken == token or st.hostReconnectToken == token then allowed = true end
-if not allowed and type(st.participants) == 'table' then
-  for i = 1, #st.participants do
-    local p = st.participants[i]
-    if type(p) == 'table' and p.id == token then allowed = true break end
-  end
-end
-if not allowed and type(st.seatAssignment) == 'table' then
-  for _, seat in ipairs({'N','E','S','W'}) do
-    if st.seatAssignment[seat] == token then allowed = true break end
-  end
-end
-if not allowed then return {0, ''} end
-local existing = redis.call('GET', KEYS[2])
-if existing then
-  redis.call('EXPIRE', KEYS[2], ARGV[3])
-  return {1, existing}
-end
-redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3], 'NX')
-existing = redis.call('GET', KEYS[2])
-return {1, existing or ''}
-`;
-
-async function claimLegacyAccess(code, reconnectToken) {
-    const candidate = generateAccessKey();
-    const result = await redisCommand([
-        'EVAL', CLAIM_LEGACY_LUA, '2', keyFor(code), accessKeyFor(code),
-        reconnectToken, candidate, String(TTL_SECONDS)
-    ]);
-    if (!Array.isArray(result) || result.length < 1) throw new Error('Réponse Redis legacy invalide.');
-    const status = Number(result[0]);
-    if (status === -1) return { notFound: true };
-    if (status === -2) throw new Error('État legacy Redis corrompu.');
-    if (status === 0) return { forbidden: true };
-    if (status !== 1 || !result[1]) throw new Error('Clé legacy Redis invalide.');
-    return { accessKey: String(result[1]) };
-}
+// `claim-legacy` supprimé pour raison de sécurité : aucune route non authentifiée ne
+// peut convertir un identifiant de participant en capacité durable de salle.
 
 // Trigger serveur vers un CANAL PRIVÉ. L'événement ne transporte volontairement plus le
 // snapshot : seulement version/updatedAt. Le contenu de partie reste exclusivement dans
@@ -386,20 +336,9 @@ module.exports = async (req, res) => {
             return;
         }
         if (body && body.action === 'claim-legacy') {
-            const code = normalizeCode(body.code);
-            const reconnectToken = typeof body.reconnectToken === 'string' ? body.reconnectToken.trim() : '';
-            if (!validCode(code) || !reconnectToken || reconnectToken.length > 256) {
-                res.status(400).json({ error: 'Paramètres legacy invalides.' });
-                return;
-            }
-            try {
-                const claimed = await claimLegacyAccess(code, reconnectToken);
-                if (claimed.notFound) { res.status(404).json({ error: 'legacy-session-not-found' }); return; }
-                if (claimed.forbidden) { res.status(403).json({ error: 'legacy-proof-invalid' }); return; }
-                res.status(200).json({ code, accessKey: claimed.accessKey });
-            } catch (e) {
-                res.status(500).json({ error: String((e && e.message) || e) });
-            }
+            // Compatibilité fail-closed avec d'anciens clients : la route existe encore
+            // nominalement mais ne rend JAMAIS de clé et ne consulte aucun token de snapshot.
+            res.status(410).json({ error: 'legacy-claim-disabled' });
             return;
         }
         res.status(400).json({ error: 'Action POST inconnue.' });
