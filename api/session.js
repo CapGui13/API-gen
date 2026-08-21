@@ -56,6 +56,7 @@ const PARTICIPANT_ID_HEADER = 'x-bridge-participant-id';
 const RECONNECT_SECRET_HEADER = 'x-bridge-reconnect-secret';
 const MODERN_GUEST_ID_RE = /^p_[A-Za-z0-9_-]{24,96}$/;
 const RECONNECT_SECRET_RE = /^s_[A-Za-z0-9_-]{32,160}$/;
+const CAPABILITY_RE = /^[A-Za-z0-9_-]{43,128}$/;
 const SEATS = ['N', 'E', 'S', 'W'];
 const SEAT_PENDING = 'PENDING';
 
@@ -655,6 +656,42 @@ async function activateRoomAccess(code, providedAccess, providedWrite) {
     return Number(result) === 1;
 }
 
+// Rotation explicite des deux capacités de salle. Les nouvelles valeurs sont générées
+// côté navigateur hôte avec Web Crypto puis commitées atomiquement ici sous preuve des
+// anciennes capacités. Cela permet au client de connaître les nouvelles valeurs même si
+// la réponse HTTP se perd après le commit : il peut sonder/réessayer avec le couple proposé
+// sans verrouiller définitivement la salle.
+const ROTATE_ROOM_CAPABILITIES_LUA = `
+local rawSession = redis.call('GET', KEYS[1])
+local durableAccess = redis.call('GET', KEYS[3])
+local reservedAccess = redis.call('GET', KEYS[2])
+local durableWrite = redis.call('GET', KEYS[5])
+local reservedWrite = redis.call('GET', KEYS[4])
+local oldAccess = ARGV[1]
+local oldWrite = ARGV[2]
+local newAccess = ARGV[3]
+local newWrite = ARGV[4]
+local storedAccess = durableAccess or reservedAccess
+local storedWrite = durableWrite or reservedWrite
+if not storedAccess or not storedWrite then return 0 end
+if storedAccess ~= oldAccess or storedWrite ~= oldWrite then return 0 end
+local ttl = rawSession and ARGV[6] or ARGV[5]
+redis.call('SET', KEYS[3], newAccess, 'EX', ttl)
+redis.call('SET', KEYS[5], newWrite, 'EX', ttl)
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[4])
+if rawSession then redis.call('EXPIRE', KEYS[1], ttl) end
+return 1
+`;
+async function rotateRoomCapabilities(code, oldAccess, oldWrite, newAccess, newWrite) {
+    const result = await redisCommand([
+        'EVAL', ROTATE_ROOM_CAPABILITIES_LUA, '5', keyFor(code), reservationKeyFor(code), accessKeyFor(code),
+        writeReservationKeyFor(code), hostWriteKeyFor(code),
+        oldAccess, oldWrite, newAccess, newWrite, String(PRESESSION_ACCESS_TTL_SECONDS), String(TTL_SECONDS)
+    ]);
+    return Number(result) === 1;
+}
+
 // `claim-legacy` supprimé pour raison de sécurité : aucune route non authentifiée ne
 // peut convertir un identifiant de participant en capacité durable de salle.
 
@@ -737,6 +774,30 @@ module.exports = async (req, res) => {
             try {
                 const ok = await activateRoomAccess(code, providedKey, providedWriteKey);
                 if (!ok) { res.status(403).json({ error: 'session-auth-invalid' }); return; }
+                res.status(200).json({ ok: true });
+            } catch (e) {
+                res.status(500).json({ error: String((e && e.message) || e) });
+            }
+            return;
+        }
+        if (body && body.action === 'rotate-room-capabilities') {
+            const code = normalizeCode(body.code);
+            const oldAccess = requestAccessKey(req);
+            const oldWrite = requestHostWriteKey(req);
+            const newAccess = typeof body.newAccessKey === 'string' ? body.newAccessKey.trim() : '';
+            const newWrite = typeof body.newHostWriteKey === 'string' ? body.newHostWriteKey.trim() : '';
+            if (!validCode(code) || !CAPABILITY_RE.test(oldAccess) || !CAPABILITY_RE.test(oldWrite)
+                || !CAPABILITY_RE.test(newAccess) || !CAPABILITY_RE.test(newWrite)
+                || safeTextEqual(oldAccess, newAccess) || safeTextEqual(oldWrite, newWrite)
+                || safeTextEqual(newAccess, newWrite)) {
+                res.status(400).json({ error: 'capability-rotation-invalid' });
+                return;
+            }
+            try {
+                const ok = await rotateRoomCapabilities(code, oldAccess, oldWrite, newAccess, newWrite);
+                if (!ok) { res.status(403).json({ error: 'session-host-write-invalid' }); return; }
+                // Le serveur ne renvoie pas les secrets dans ses logs/événements. Le client
+                // connaît déjà les nouvelles valeurs qu'il vient de proposer.
                 res.status(200).json({ ok: true });
             } catch (e) {
                 res.status(500).json({ error: String((e && e.message) || e) });
