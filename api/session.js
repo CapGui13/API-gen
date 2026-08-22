@@ -546,32 +546,53 @@ async function buildRestrictedParticipantState(current, proposed, actorId) {
         throw new Error('participant-auction-rewrite-forbidden');
     }
 
-    // Si le tour autoritaire de la donne partagée appartient maintenant à un robot, PONS
-    // est exécuté ICI, côté serveur. Cela couvre à la fois :
-    // - l'annonce humaine relayée qui vient de donner la main à un robot ;
-    // - un ancien client qui a inclus une annonce robot dans son suffixe (valeur ignorée) ;
-    // - une reprise différée qui envoie un snapshot inchangé uniquement pour demander de
-    //   faire progresser le tour robot.
-    // Un participant doit être réellement assis, et on n'auto-avance pas une seconde donne
-    // si ce même PUT a déjà modifié une autre donne.
+    // Si le tour autoritaire appartient maintenant à un robot, PONS est exécuté ICI,
+    // côté serveur. En live, l'unique donne autoritaire reste `current.boardIndex`.
+    // En mode différé, chaque joueur peut en revanche travailler sur une donne différente :
+    // le boardIndex partagé du host NE DOIT donc pas détourner la continuation robot de la
+    // donne réellement modifiée par le participant.
+    //
+    // Priorité différée :
+    // 1. la donne que cette mutation vient effectivement de changer (`actorChangedBoard`) ;
+    // 2. sinon le `proposed.boardIndex` comme simple HINT de reprise/polling ;
+    // 3. sinon le boardIndex partagé courant.
+    //
+    // Le hint n'est jamais recopié dans `next.boardIndex` : la navigation différée reste
+    // locale à chaque navigateur. PONS reste l'unique autorité sur la valeur des appels
+    // robot, donc permettre à un participant assis de demander l'avancement d'une autre
+    // donne ne lui donne aucune autorité métier supplémentaire.
     const sharedBoardIndex = Number.isInteger(current.boardIndex) ? current.boardIndex : -1;
+    const proposedBoardIndex = Number.isInteger(proposed.boardIndex)
+        && proposed.boardIndex >= 0
+        && proposed.boardIndex < next.deals.length
+        ? proposed.boardIndex
+        : -1;
+    const isDeferredRoom = current.deferredRoomMode === true;
+    let robotBoardIndex = sharedBoardIndex;
+    if (isDeferredRoom) {
+        if (actorChangedBoard != null) robotBoardIndex = actorChangedBoard;
+        else if (proposedBoardIndex >= 0) robotBoardIndex = proposedBoardIndex;
+    }
+
     const actorIsSeated = actorSeats(next, actorId).length > 0;
-    if (actorIsSeated && sharedBoardIndex >= 0 && next.deals[sharedBoardIndex]
-        && (actorChangedBoard == null || actorChangedBoard === sharedBoardIndex)) {
-        const sharedDeal = next.deals[sharedBoardIndex];
-        const sharedHistory = Array.isArray(sharedDeal.auctionHistory) ? sharedDeal.auctionHistory : [];
-        const expectedSeat = currentTurnSeatServer(sharedDeal.dealer, sharedHistory);
-        if (expectedSeat && isRobotSeat(next.seatAssignment, expectedSeat) && !isAuctionOverServer(sharedHistory)) {
+    const mayAdvanceRobotBoard = isDeferredRoom
+        || actorChangedBoard == null
+        || actorChangedBoard === sharedBoardIndex;
+    if (actorIsSeated && mayAdvanceRobotBoard && robotBoardIndex >= 0 && next.deals[robotBoardIndex]) {
+        const robotDeal = next.deals[robotBoardIndex];
+        const robotHistory = Array.isArray(robotDeal.auctionHistory) ? robotDeal.auctionHistory : [];
+        const expectedSeat = currentTurnSeatServer(robotDeal.dealer, robotHistory);
+        if (expectedSeat && isRobotSeat(next.seatAssignment, expectedSeat) && !isAuctionOverServer(robotHistory)) {
             const advanced = await advanceRobotAuction({
-                deal: sharedDeal,
-                history: sharedHistory,
+                deal: robotDeal,
+                history: robotHistory,
                 seatAssignment: next.seatAssignment,
                 currentTurnSeat: currentTurnSeatServer,
                 isCallLegal: isServerCallLegal,
                 isAuctionOver: isAuctionOverServer,
                 maxCalls: 64
             });
-            next.deals[sharedBoardIndex].auctionHistory = advanced.history;
+            next.deals[robotBoardIndex].auctionHistory = advanced.history;
         }
     }
 
