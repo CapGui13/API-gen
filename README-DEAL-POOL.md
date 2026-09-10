@@ -29,3 +29,4 @@ Valeurs par défaut : cible 240 donnes, seuil bas 160, ajout par vague 24, enric
 3. Déployer ensuite les fichiers PLAY modifiés (`app.js`, `statistical-par.js`, `sw.js`, plus le nouveau test).
 
 Le frontend possède un fallback local, mais déployer le backend en premier évite d'attendre le timeout réseau lors d'une génération si l'endpoint n'existe pas encore.
+
