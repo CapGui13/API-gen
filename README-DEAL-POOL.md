@@ -30,3 +30,4 @@ Valeurs par défaut : cible 240 donnes, seuil bas 160, ajout par vague 24, enric
 
 Le frontend possède un fallback local, mais déployer le backend en premier évite d'attendre le timeout réseau lors d'une génération si l'endpoint n'existe pas encore.
 
+
