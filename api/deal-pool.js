@@ -1,39 +1,28 @@
-// api/deal-pool.js — réservoir caché de donnes aléatoires pré-calculées pour PLAY.
+// api/deal-pool.js — PLAY Deal Pool V3.
 //
-// V1 : chaque donne READY contient déjà sa table double-mort exacte.
-// V2 : en tâche de réapprovisionnement, certaines donnes sont enrichies avec 24 tables
-//      statistiques brutes pour chaque camp (NS / EW). Ces tables sont indépendantes du
-//      numéro de board, du donneur et de la vulnérabilité ; le frontend n'en extrait que
-//      les cellules nécessaires au PAR statistique.
+// V3 sépare le calcul lourd du service en production :
+// - GitHub Actions fabrique des donnes complètement pré-calculées et les range dans Upstash.
+// - Vercel ne fait ici que filtrer/consommer atomiquement le stock et répondre à PLAY.
 //
-// Stockage : réutilise l'Upstash Redis déjà configuré pour API-gen.
-// Aucun secret ni contenu du stock n'est exposé : POST action=take ne renvoie que le lot
-// effectivement consommé par la session.
+// Une donne V3 READY contient :
+// - les 52 cartes ;
+// - la table double-mort exacte ;
+// - 72 redistributions statistiques brutes + tables DD pour NS ;
+// - 72 redistributions statistiques brutes + tables DD pour EW.
+//
+// Le PAR conditionné par l'enchère PONS reste volontairement calculé côté PLAY, car son
+// échantillon dépend d'une enchère qui n'existe pas encore au moment du pré-calcul.
 
 const crypto = require('crypto');
-const StatisticalPar = require('../lib/pool-statistical-sampler');
-
-global.Module = global.Module || {};
-require('./dds-lib.js');
-const calcDDTable = global.Module.cwrap('generateDDTable', 'string', ['string']);
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-const POOL_VERSION = 'play-deal-pool-v2';
-const DATA_KEY = 'bridge-deal-pool:v2:data';
-const READY_KEY = 'bridge-deal-pool:v2:ready';
-const V2_QUEUE_KEY = 'bridge-deal-pool:v2:needs-stat';
-const REFILL_LOCK_KEY = 'bridge-deal-pool:v2:refill-lock';
-
-const POOL_TARGET = clampInt(process.env.BRIDGE_DEAL_POOL_TARGET, 240, 40, 4000);
-const POOL_LOW_WATER = clampInt(process.env.BRIDGE_DEAL_POOL_LOW_WATER, 160, 0, POOL_TARGET);
-const REFILL_BATCH = clampInt(process.env.BRIDGE_DEAL_POOL_REFILL_BATCH, 24, 1, 80);
-const V2_PER_REFILL = clampInt(process.env.BRIDGE_DEAL_POOL_V2_PER_REFILL, 1, 0, 3);
-const V2_SAMPLE_COUNT = 24;
+const POOL_VERSION = 'play-deal-pool-v3-precomputed72';
+const DATA_KEY = 'bridge-deal-pool:v3:data';
+const READY_KEY = 'bridge-deal-pool:v3:ready';
 const TAKE_MAX_COUNT = 40;
-const TAKE_SCAN_CAP = 2000;
-const REFILL_LOCK_SECONDS = 180;
+const TAKE_SCAN_CAP = 4000;
 
 const DEFAULT_ALLOWED_ORIGINS = ['https://capgui13.github.io'];
 const EXTRA_ALLOWED_ORIGINS = String(process.env.BRIDGE_ALLOWED_ORIGINS || '')
@@ -42,14 +31,6 @@ const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ALLOWED_OR
 
 const SEATS = ['N', 'E', 'S', 'W'];
 const SUITS = ['S', 'H', 'D', 'C'];
-const RANKS = 'AKQJT98765432';
-const HCP = { A: 4, K: 3, Q: 2, J: 1 };
-
-function clampInt(raw, fallback, min, max) {
-    const n = Number.parseInt(raw, 10);
-    if (!Number.isFinite(n)) return fallback;
-    return Math.max(min, Math.min(max, n));
-}
 
 function isAllowedOrigin(origin) {
     if (!origin) return true;
@@ -105,170 +86,15 @@ return 1
 `;
 
 async function applyRateLimit(req, action, cost = 1) {
-    const replenish = action === 'replenish';
-    const clientLimit = replenish ? 8 : 120;
-    const globalLimit = replenish ? 80 : 3000;
+    const lightweight = action === 'replenish' || action === 'status';
+    const clientLimit = lightweight ? 120 : 120;
+    const globalLimit = lightweight ? 3000 : 3000;
     return Number(await redisCommand([
         'EVAL', RATE_LUA, '2',
-        `bridge-deal-pool-rate:${action}:client:${rateSubject(req)}`,
-        `bridge-deal-pool-rate:${action}:global`,
+        `bridge-deal-pool-rate:v3:${action}:client:${rateSubject(req)}`,
+        `bridge-deal-pool-rate:v3:${action}:global`,
         '60', String(clientLimit), String(globalLimit), String(cost)
     ]));
-}
-
-function shuffledDeck() {
-    const deck = [];
-    for (const suit of SUITS) for (const rank of RANKS) deck.push({ suit, rank });
-    for (let i = deck.length - 1; i > 0; i--) {
-        const j = crypto.randomInt(i + 1);
-        [deck[i], deck[j]] = [deck[j], deck[i]];
-    }
-    return deck;
-}
-
-function dealFromDeck(deck) {
-    const hands = {};
-    for (let seatIndex = 0; seatIndex < 4; seatIndex++) {
-        const seat = SEATS[seatIndex];
-        const cards = deck.slice(seatIndex * 13, seatIndex * 13 + 13);
-        hands[seat] = {};
-        for (const suit of SUITS) {
-            const rankSet = new Set(cards.filter(card => card.suit === suit).map(card => card.rank));
-            hands[seat][suit] = Array.from(RANKS).filter(rank => rankSet.has(rank)).join('');
-        }
-    }
-    return hands;
-}
-
-function handHcp(hand) {
-    let total = 0;
-    for (const suit of SUITS) for (const rank of String(hand && hand[suit] || '')) total += HCP[rank] || 0;
-    return total;
-}
-
-function metadataForHands(hands) {
-    const hcp = {};
-    const lengths = {};
-    for (const seat of SEATS) {
-        hcp[seat] = handHcp(hands[seat]);
-        lengths[seat] = {};
-        for (const suit of SUITS) lengths[seat][suit] = String(hands[seat][suit] || '').length;
-    }
-    return {
-        hcp,
-        lineHcp: { NS: hcp.N + hcp.S, EW: hcp.E + hcp.W },
-        lengths
-    };
-}
-
-function handsToPbn(hands) {
-    return 'N:' + SEATS.map(seat => SUITS.map(suit => String(hands[seat][suit] || '')).join('.')).join(' ');
-}
-
-function solveTableForHands(hands) {
-    const raw = calcDDTable(handsToPbn(hands));
-    const table = JSON.parse(raw);
-    if (!table || typeof table !== 'object') throw new Error('DDS table invalide');
-    return table;
-}
-
-function newPoolRecord() {
-    const hands = dealFromDeck(shuffledDeck());
-    const statisticalSeedId = 'pool_' + crypto.randomBytes(18).toString('base64url');
-    return {
-        poolVersion: POOL_VERSION,
-        statisticalSeedId,
-        hands,
-        ddTable: solveTableForHands(hands),
-        meta: metadataForHands(hands),
-        precomputedStatV1: null,
-        createdAt: new Date().toISOString()
-    };
-}
-
-function configForSide(side) {
-    const normalized = side === 'EW' ? 'EW' : 'NS';
-    const knownSeats = normalized === 'NS' ? ['N', 'S'] : ['E', 'W'];
-    const randomizedSeats = normalized === 'NS' ? ['E', 'W'] : ['N', 'S'];
-    return {
-        ok: true,
-        mode: 'two-known-hands',
-        knownSeats: knownSeats.slice(),
-        humanSeats: knownSeats.slice(),
-        actualHumanSeats: knownSeats.slice(),
-        pendingSeats: [],
-        reservedHumanSeats: knownSeats.slice(),
-        randomizedSeats: randomizedSeats.slice(),
-        botSeats: randomizedSeats.slice(),
-        humanSide: normalized,
-        botSide: normalized === 'NS' ? 'EW' : 'NS',
-        diagnosticPerspective: 'optimal-contract-side'
-    };
-}
-
-function enrichRecordV2(record) {
-    if (!record || !record.hands || !record.statisticalSeedId) return record;
-    if (record.precomputedStatV1
-        && record.precomputedStatV1.samplingSeedVersion === StatisticalPar.STATISTICAL_PAR_SAMPLING_SEED_VERSION) return record;
-
-    // dealer/vulnerable/board sont volontairement absents : pour une donne du pool,
-    // deterministicSeedMaterial utilise statisticalSeedId et ne dépend plus de ces champs.
-    const deal = { hands: record.hands, statisticalSeedId: record.statisticalSeedId };
-    const sides = { NS: [], EW: [] };
-    for (const side of ['NS', 'EW']) {
-        const config = configForSide(side);
-        for (let sampleIndex = 0; sampleIndex < V2_SAMPLE_COUNT; sampleIndex++) {
-            const sampleHands = StatisticalPar.sampleHandsDeterministic(deal, config, sampleIndex);
-            sides[side].push({ sampleIndex, table: solveTableForHands(sampleHands) });
-        }
-    }
-    record.precomputedStatV1 = {
-        format: 'universal-dd-24',
-        statisticalSeedId: record.statisticalSeedId,
-        samplingSeedVersion: StatisticalPar.STATISTICAL_PAR_SAMPLING_SEED_VERSION,
-        sampleCount: V2_SAMPLE_COUNT,
-        sides
-    };
-    record.statEnrichedAt = new Date().toISOString();
-    return record;
-}
-
-async function addFreshRecords(count) {
-    const n = Math.max(0, Number(count || 0));
-    if (!n) return 0;
-    const pairs = [];
-    const ids = [];
-    for (let i = 0; i < n; i++) {
-        const id = 'd_' + crypto.randomBytes(15).toString('base64url');
-        const record = newPoolRecord();
-        pairs.push(id, JSON.stringify(record));
-        ids.push(id);
-    }
-    if (!ids.length) return 0;
-    await redisCommand(['HSET', DATA_KEY, ...pairs]);
-    await redisCommand(['RPUSH', READY_KEY, ...ids]);
-    await redisCommand(['RPUSH', V2_QUEUE_KEY, ...ids]);
-    return ids.length;
-}
-
-async function enrichNextRecordV2() {
-    for (let attempt = 0; attempt < 8; attempt++) {
-        const id = await redisCommand(['LPOP', V2_QUEUE_KEY]);
-        if (!id) return false;
-        const raw = await redisCommand(['HGET', DATA_KEY, id]);
-        if (!raw) continue; // déjà consommée avant l'enrichissement
-        try {
-            const record = enrichRecordV2(JSON.parse(raw));
-            await redisCommand(['HSET', DATA_KEY, id, JSON.stringify(record)]);
-            return true;
-        } catch (err) {
-            // Une panne DDS ponctuelle ne condamne pas la donne : elle retourne en fin de
-            // file pour une future tentative, tout en restant utilisable immédiatement V1.
-            await redisCommand(['RPUSH', V2_QUEUE_KEY, id]);
-            throw err;
-        }
-    }
-    return false;
 }
 
 const TAKE_LUA = `
@@ -347,7 +173,7 @@ return acceptedRaw
 `;
 
 async function takeDeals(count, seatAssignment, constraints) {
-    const scanCap = Math.min(TAKE_SCAN_CAP, Math.max(80, Number(count) * 50));
+    const scanCap = Math.min(TAKE_SCAN_CAP, Math.max(120, Number(count) * 80));
     const result = await redisCommand([
         'EVAL', TAKE_LUA, '2', DATA_KEY, READY_KEY,
         String(count), String(scanCap),
@@ -356,35 +182,6 @@ async function takeDeals(count, seatAssignment, constraints) {
     ]);
     if (!Array.isArray(result) || result.length !== count) return [];
     return result.map(raw => JSON.parse(raw));
-}
-
-async function withRefillLock(fn) {
-    const token = crypto.randomBytes(16).toString('hex');
-    const acquired = await redisCommand(['SET', REFILL_LOCK_KEY, token, 'NX', 'EX', String(REFILL_LOCK_SECONDS)]);
-    if (acquired !== 'OK') return { locked: true };
-    try {
-        return await fn();
-    } finally {
-        const releaseLua = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`;
-        await redisCommand(['EVAL', releaseLua, '1', REFILL_LOCK_KEY, token]).catch(() => {});
-    }
-}
-
-async function replenishPool() {
-    return withRefillLock(async () => {
-        const before = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
-        let added = 0;
-        if (before < POOL_LOW_WATER || before < POOL_TARGET) {
-            added = await addFreshRecords(Math.min(REFILL_BATCH, Math.max(0, POOL_TARGET - before)));
-        }
-        let enriched = 0;
-        for (let i = 0; i < V2_PER_REFILL; i++) {
-            if (await enrichNextRecordV2()) enriched++;
-            else break;
-        }
-        const after = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
-        return { locked: false, before, after, added, enriched };
-    });
 }
 
 function validCount(value) {
@@ -423,6 +220,12 @@ function sanitizeConstraints(raw) {
     return out;
 }
 
+async function stockStatus() {
+    const ready = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
+    const records = Number(await redisCommand(['HLEN', DATA_KEY]) || 0);
+    return { poolVersion: POOL_VERSION, ready, records, maintenance: 'github-actions' };
+}
+
 module.exports = async function handler(req, res) {
     if (!applyCors(req, res)) {
         res.status(403).json({ error: 'origin-forbidden' });
@@ -443,7 +246,7 @@ module.exports = async function handler(req, res) {
     }
 
     const action = String(req.body && req.body.action || 'take').toLowerCase();
-    if (action !== 'take' && action !== 'replenish') {
+    if (!['take', 'replenish', 'status'].includes(action)) {
         res.status(400).json({ error: 'action-invalid' });
         return;
     }
@@ -456,9 +259,11 @@ module.exports = async function handler(req, res) {
             return;
         }
 
-        if (action === 'replenish') {
-            const result = await replenishPool();
-            res.status(result && result.locked ? 202 : 200).json({ ok: true, ...result });
+        // Compatibilité avec le PLAY déjà déployé : il appelle replenish après un take.
+        // En V3, ce POST est volontairement léger ; le remplissage lourd est fait par
+        // GitHub Actions et non par Vercel.
+        if (action === 'replenish' || action === 'status') {
+            res.status(200).json({ ok: true, ...(await stockStatus()) });
             return;
         }
 
@@ -473,8 +278,8 @@ module.exports = async function handler(req, res) {
             sanitizeConstraints(req.body && req.body.constraints)
         );
         if (deals.length !== count) {
-            // Le frontend comprend 204 comme « stock insuffisant » et reprend immédiatement
-            // sa génération locale historique. Rien n'est partiellement consommé côté Redis.
+            // Stock/contraintes insuffisants : PLAY bascule immédiatement sur son générateur
+            // local historique, sans consommation partielle du stock.
             res.status(204).end();
             return;
         }
