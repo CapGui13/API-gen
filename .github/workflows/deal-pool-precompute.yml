@@ -11,6 +11,10 @@ on:
         description: "Plafond de donnes calculées pendant ce run (sécurité)"
         required: false
         default: "1000"
+  schedule:
+    # Une fois par jour, à 03:17 UTC
+    # = 05:17 en France l'été / 04:17 en hiver.
+    - cron: "17 3 * * *"
 
 permissions:
   contents: read
