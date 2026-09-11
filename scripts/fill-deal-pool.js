@@ -1,17 +1,27 @@
 #!/usr/bin/env node
 'use strict';
 
-// Générateur hors-Vercel du stock PLAY V3.
-// Il tourne dans GitHub Actions, calcule complètement les donnes (DD exact + 72 tables
-// statistiques brutes pour NS + 72 pour EW), puis ne publie la donne dans READY qu'une
-// fois tous les calculs terminés.
+// Générateur hors-Vercel du stock PLAY V3.1.
+// Il tourne dans UN SEUL job GitHub Actions, mais exploite plusieurs threads CPU internes
+// pour pré-calculer plusieurs donnes en parallèle. Cela n'occupe donc toujours qu'un seul
+// runner GitHub, même si 2 (ou plus) donnes sont calculées simultanément.
+//
+// Chaque donne n'est publiée dans READY qu'une fois tous ses calculs terminés :
+// DD exact + 72 tables statistiques brutes NS + 72 EW.
 
 const crypto = require('crypto');
-const StatisticalPar = require('../lib/pool-statistical-sampler');
+const { Worker, isMainThread, parentPort } = require('worker_threads');
 
-global.Module = global.Module || {};
-require('../api/dds-lib.js');
-const calcDDTable = global.Module.cwrap('generateDDTable', 'string', ['string']);
+// DDS + sampler ne sont chargés que dans les workers de calcul. Le thread principal reste
+// léger : il orchestre les workers et publie les résultats dans Upstash.
+let StatisticalPar = null;
+let calcDDTable = null;
+if (!isMainThread) {
+    StatisticalPar = require('../lib/pool-statistical-sampler');
+    global.Module = global.Module || {};
+    require('../api/dds-lib.js');
+    calcDDTable = global.Module.cwrap('generateDDTable', 'string', ['string']);
+}
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -21,6 +31,9 @@ const DATA_KEY = 'bridge-deal-pool:v3:data';
 const READY_KEY = 'bridge-deal-pool:v3:ready';
 const POOL_TARGET = clampInt(process.env.BRIDGE_DEAL_POOL_TARGET, 240, 40, 2000);
 const BATCH_SIZE = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_BATCH, 8, 1, 40);
+// 2 par défaut : accélère sensiblement sans prendre de runner GitHub supplémentaire.
+// Ajustable à 1..4 via variable d'environnement si on veut benchmarker plus tard.
+const BUILD_CONCURRENCY = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_CONCURRENCY, 2, 1, 4);
 const SAMPLE_COUNT = 72;
 
 const SEATS = ['N', 'E', 'S', 'W'];
@@ -167,29 +180,79 @@ async function publishRecord(record) {
     return id;
 }
 
+function buildRecordInWorker() {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker(__filename);
+        let settled = false;
+
+        worker.once('message', message => {
+            settled = true;
+            if (message && message.ok && message.record) resolve(message.record);
+            else reject(new Error(message && message.error || 'worker DDS invalide'));
+        });
+        worker.once('error', err => {
+            settled = true;
+            reject(err);
+        });
+        worker.once('exit', code => {
+            if (!settled && code !== 0) reject(new Error(`worker DDS terminé avec code ${code}`));
+            else if (!settled) reject(new Error('worker DDS terminé sans résultat'));
+        });
+    });
+}
+
 async function main() {
     const before = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
     const missing = Math.max(0, POOL_TARGET - before);
     const toBuild = Math.min(BATCH_SIZE, missing);
-    console.log(`[deal-pool] ready=${before}, target=${POOL_TARGET}, batch=${BATCH_SIZE}, toBuild=${toBuild}`);
+    const parallel = Math.min(BUILD_CONCURRENCY, Math.max(1, toBuild));
+    console.log(`[deal-pool] ready=${before}, target=${POOL_TARGET}, batch=${BATCH_SIZE}, concurrency=${parallel}, toBuild=${toBuild}`);
     if (!toBuild) {
         console.log('[deal-pool] stock déjà au niveau cible, aucun calcul nécessaire.');
         return;
     }
 
     let built = 0;
-    for (let i = 0; i < toBuild; i++) {
-        const t0 = Date.now();
-        const record = buildFullyPrecomputedRecord();
-        const id = await publishRecord(record);
-        built++;
-        console.log(`[deal-pool] ${built}/${toBuild} publié ${id} (${((Date.now() - t0) / 1000).toFixed(1)} s)`);
+    let nextIndex = 0;
+    const failures = [];
+
+    async function workerLoop(slot) {
+        while (true) {
+            const index = nextIndex++;
+            if (index >= toBuild) return;
+            const t0 = Date.now();
+            try {
+                const record = await buildRecordInWorker();
+                const id = await publishRecord(record);
+                built++;
+                console.log(`[deal-pool] ${built}/${toBuild} publié ${id} (slot=${slot}, ${((Date.now() - t0) / 1000).toFixed(1)} s)`);
+            } catch (err) {
+                failures.push({ index, error: String(err && err.stack || err) });
+                console.error(`[deal-pool] échec calcul ${index + 1}/${toBuild} (slot=${slot}) :`, err && err.stack || err);
+            }
+        }
     }
+
+    await Promise.all(Array.from({ length: parallel }, (_, i) => workerLoop(i + 1)));
+
     const after = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
-    console.log(`[deal-pool] terminé : before=${before}, after=${after}, added=${built}`);
+    console.log(`[deal-pool] terminé : before=${before}, after=${after}, added=${built}, failures=${failures.length}`);
+    if (failures.length) {
+        throw new Error(`${failures.length} calcul(s) de donne ont échoué`);
+    }
 }
 
-main().catch(err => {
-    console.error('[deal-pool] ECHEC:', err && err.stack || err);
-    process.exitCode = 1;
-});
+if (isMainThread) {
+    main().catch(err => {
+        console.error('[deal-pool] ECHEC:', err && err.stack || err);
+        process.exitCode = 1;
+    });
+} else {
+    try {
+        const record = buildFullyPrecomputedRecord();
+        parentPort.postMessage({ ok: true, record });
+    } catch (err) {
+        parentPort.postMessage({ ok: false, error: String(err && err.stack || err) });
+        process.exitCode = 1;
+    }
+}
