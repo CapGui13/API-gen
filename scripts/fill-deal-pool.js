@@ -1,19 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
-// Générateur hors-Vercel du stock PLAY V3.1.
-// Il tourne dans UN SEUL job GitHub Actions, mais exploite plusieurs threads CPU internes
-// pour pré-calculer plusieurs donnes en parallèle. Cela n'occupe donc toujours qu'un seul
-// runner GitHub, même si 2 (ou plus) donnes sont calculées simultanément.
-//
-// Chaque donne n'est publiée dans READY qu'une fois tous ses calculs terminés :
-// DD exact + 72 tables statistiques brutes NS + 72 EW.
-
 const crypto = require('crypto');
 const { Worker, isMainThread, parentPort } = require('worker_threads');
 
-// DDS + sampler ne sont chargés que dans les workers de calcul. Le thread principal reste
-// léger : il orchestre les workers et publie les résultats dans Upstash.
 let StatisticalPar = null;
 let calcDDTable = null;
 if (!isMainThread) {
@@ -30,9 +20,7 @@ const POOL_VERSION = 'play-deal-pool-v3-precomputed72';
 const DATA_KEY = 'bridge-deal-pool:v3:data';
 const READY_KEY = 'bridge-deal-pool:v3:ready';
 const POOL_TARGET = clampInt(process.env.BRIDGE_DEAL_POOL_TARGET, 240, 40, 2000);
-const BATCH_SIZE = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_BATCH, 8, 1, 40);
-// 2 par défaut : accélère sensiblement sans prendre de runner GitHub supplémentaire.
-// Ajustable à 1..4 via variable d'environnement si on veut benchmarker plus tard.
+const BATCH_SIZE = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_BATCH, 240, 1, 240);
 const BUILD_CONCURRENCY = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_CONCURRENCY, 2, 1, 4);
 const SAMPLE_COUNT = 72;
 
@@ -97,11 +85,7 @@ function metadataForHands(hands) {
         lengths[seat] = {};
         for (const suit of SUITS) lengths[seat][suit] = String(hands[seat][suit] || '').length;
     }
-    return {
-        hcp,
-        lineHcp: { NS: hcp.N + hcp.S, EW: hcp.E + hcp.W },
-        lengths
-    };
+    return { hcp, lineHcp: { NS: hcp.N + hcp.S, EW: hcp.E + hcp.W }, lengths };
 }
 
 function handsToPbn(hands) {
@@ -173,8 +157,6 @@ function buildFullyPrecomputedRecord() {
 
 async function publishRecord(record) {
     const id = 'd3_' + crypto.randomBytes(15).toString('base64url');
-    // DATA d'abord, READY ensuite : une panne entre les deux crée au pire un orphelin,
-    // jamais une entrée READY pointant vers une donnée incomplète.
     await redisCommand(['HSET', DATA_KEY, id, JSON.stringify(record)]);
     await redisCommand(['RPUSH', READY_KEY, id]);
     return id;
@@ -184,16 +166,12 @@ function buildRecordInWorker() {
     return new Promise((resolve, reject) => {
         const worker = new Worker(__filename);
         let settled = false;
-
         worker.once('message', message => {
             settled = true;
             if (message && message.ok && message.record) resolve(message.record);
             else reject(new Error(message && message.error || 'worker DDS invalide'));
         });
-        worker.once('error', err => {
-            settled = true;
-            reject(err);
-        });
+        worker.once('error', err => { settled = true; reject(err); });
         worker.once('exit', code => {
             if (!settled && code !== 0) reject(new Error(`worker DDS terminé avec code ${code}`));
             else if (!settled) reject(new Error('worker DDS terminé sans résultat'));
@@ -237,9 +215,7 @@ async function main() {
 
     const after = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
     console.log(`[deal-pool] terminé : before=${before}, after=${after}, added=${built}, failures=${failures.length}`);
-    if (failures.length) {
-        throw new Error(`${failures.length} calcul(s) de donne ont échoué`);
-    }
+    if (failures.length) throw new Error(`${failures.length} calcul(s) de donne ont échoué`);
 }
 
 if (isMainThread) {

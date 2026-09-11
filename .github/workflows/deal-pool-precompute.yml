@@ -10,12 +10,7 @@ on:
       batch:
         description: "Donnes calculées au maximum pendant ce run"
         required: false
-        default: "40"
-  schedule:
-    # Passage toutes les 10 minutes. Un seul job peut tourner à la fois grâce au
-    # groupe concurrency ci-dessous. Une fois le stock à 240, le run s'arrête
-    # presque immédiatement après le LLEN Upstash et ne fait plus de DDS.
-    - cron: "7,17,27,37,47,57 * * * *"
+        default: "240"
 
 permissions:
   contents: read
@@ -27,7 +22,7 @@ concurrency:
 jobs:
   fill:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 300
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,5 +37,6 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           BRIDGE_DEAL_POOL_TARGET: ${{ github.event.inputs.target || '240' }}
-          BRIDGE_DEAL_POOL_BUILD_BATCH: ${{ github.event.inputs.batch || '40' }}
+          BRIDGE_DEAL_POOL_BUILD_BATCH: ${{ github.event.inputs.batch || '240' }}
+          BRIDGE_DEAL_POOL_BUILD_CONCURRENCY: "2"
         run: node scripts/fill-deal-pool.js
