@@ -12,10 +12,10 @@ on:
         required: false
         default: "40"
   schedule:
-    # Deux passages par heure. Un seul job peut tourner à la fois grâce au groupe
-    # concurrency ci-dessous. Une fois le stock à 240, le run s'arrête presque
-    # immédiatement après le LLEN Upstash et ne fait plus de DDS.
-    - cron: "7,37 * * * *"
+    # Passage toutes les 10 minutes. Un seul job peut tourner à la fois grâce au
+    # groupe concurrency ci-dessous. Une fois le stock à 240, le run s'arrête
+    # presque immédiatement après le LLEN Upstash et ne fait plus de DDS.
+    - cron: "7,17,27,37,47,57 * * * *"
 
 permissions:
   contents: read
