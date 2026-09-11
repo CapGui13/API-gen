@@ -1,12 +1,18 @@
-API-gen — remplissage du Deal Pool en un seul run
+API-gen — Deal Pool cible LIVE 240
 
-Remplacer dans CapGui13/API-gen :
+Tu peux pousser ces fichiers pendant que le run actuel tourne.
+
+IMPORTANT :
+- le run actuellement en cours a déjà checkout l'ancien commit ;
+- il continuera donc normalement avec l'ancien comportement ;
+- le nouveau code ne s'appliquera qu'au prochain run.
+
+Nouveau comportement :
+- relit le stock READY réel après chaque vague ;
+- si PLAY consomme des donnes pendant la génération, le générateur continue ;
+- arrêt seulement quand READY >= target (240), ou si le plafond de sécurité est atteint ;
+- toujours 1 seul runner GitHub, concurrence interne = 2.
+
+Fichiers :
 - .github/workflows/deal-pool-precompute.yml
 - scripts/fill-deal-pool.js
-
-Après push :
-GitHub > API-gen > Actions > PLAY deal pool precompute > Run workflow
-Laisser target=240 et batch=240, puis lancer.
-
-Le run utilise un seul runner GitHub mais 2 worker_threads internes.
-Il reprend automatiquement à partir du nombre READY déjà présent.

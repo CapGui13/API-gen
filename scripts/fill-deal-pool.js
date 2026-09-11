@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 'use strict';
 
+// Générateur hors-Vercel du stock PLAY V3.2.
+// Un seul job GitHub Actions, plusieurs threads CPU internes.
+//
+// Différence V3.2 : le nombre de donnes à produire n'est plus figé au démarrage.
+// Le script relit LLEN READY après chaque vague de calcul et continue tant que
+// le stock REEL est inférieur à POOL_TARGET. Ainsi, si PLAY consomme des donnes
+// pendant le run, elles sont compensées avant la fin du run.
+//
+// BRIDGE_DEAL_POOL_BUILD_BATCH devient uniquement un plafond de sécurité.
+
 const crypto = require('crypto');
 const { Worker, isMainThread, parentPort } = require('worker_threads');
 
@@ -20,7 +30,7 @@ const POOL_VERSION = 'play-deal-pool-v3-precomputed72';
 const DATA_KEY = 'bridge-deal-pool:v3:data';
 const READY_KEY = 'bridge-deal-pool:v3:ready';
 const POOL_TARGET = clampInt(process.env.BRIDGE_DEAL_POOL_TARGET, 240, 40, 2000);
-const BATCH_SIZE = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_BATCH, 240, 1, 240);
+const BUILD_LIMIT = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_BATCH, 1000, 1, 2000);
 const BUILD_CONCURRENCY = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_CONCURRENCY, 2, 1, 4);
 const SAMPLE_COUNT = 72;
 
@@ -45,6 +55,10 @@ async function redisCommand(command) {
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok || data.error) throw new Error(data.error || `Upstash HTTP ${resp.status}`);
     return data.result;
+}
+
+async function readyCount() {
+    return Number(await redisCommand(['LLEN', READY_KEY]) || 0);
 }
 
 function shuffledDeck() {
@@ -85,7 +99,11 @@ function metadataForHands(hands) {
         lengths[seat] = {};
         for (const suit of SUITS) lengths[seat][suit] = String(hands[seat][suit] || '').length;
     }
-    return { hcp, lineHcp: { NS: hcp.N + hcp.S, EW: hcp.E + hcp.W }, lengths };
+    return {
+        hcp,
+        lineHcp: { NS: hcp.N + hcp.S, EW: hcp.E + hcp.W },
+        lengths
+    };
 }
 
 function handsToPbn(hands) {
@@ -166,12 +184,16 @@ function buildRecordInWorker() {
     return new Promise((resolve, reject) => {
         const worker = new Worker(__filename);
         let settled = false;
+
         worker.once('message', message => {
             settled = true;
             if (message && message.ok && message.record) resolve(message.record);
             else reject(new Error(message && message.error || 'worker DDS invalide'));
         });
-        worker.once('error', err => { settled = true; reject(err); });
+        worker.once('error', err => {
+            settled = true;
+            reject(err);
+        });
         worker.once('exit', code => {
             if (!settled && code !== 0) reject(new Error(`worker DDS terminé avec code ${code}`));
             else if (!settled) reject(new Error('worker DDS terminé sans résultat'));
@@ -180,42 +202,47 @@ function buildRecordInWorker() {
 }
 
 async function main() {
-    const before = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
-    const missing = Math.max(0, POOL_TARGET - before);
-    const toBuild = Math.min(BATCH_SIZE, missing);
-    const parallel = Math.min(BUILD_CONCURRENCY, Math.max(1, toBuild));
-    console.log(`[deal-pool] ready=${before}, target=${POOL_TARGET}, batch=${BATCH_SIZE}, concurrency=${parallel}, toBuild=${toBuild}`);
-    if (!toBuild) {
-        console.log('[deal-pool] stock déjà au niveau cible, aucun calcul nécessaire.');
-        return;
-    }
+    const before = await readyCount();
+    console.log(`[deal-pool] ready=${before}, target=${POOL_TARGET}, buildLimit=${BUILD_LIMIT}, concurrency=${BUILD_CONCURRENCY}`);
 
     let built = 0;
-    let nextIndex = 0;
-    const failures = [];
+    let failures = 0;
 
-    async function workerLoop(slot) {
-        while (true) {
-            const index = nextIndex++;
-            if (index >= toBuild) return;
-            const t0 = Date.now();
-            try {
-                const record = await buildRecordInWorker();
-                const id = await publishRecord(record);
+    while (built < BUILD_LIMIT) {
+        const liveReady = await readyCount();
+        const missing = Math.max(0, POOL_TARGET - liveReady);
+
+        if (!missing) {
+            console.log(`[deal-pool] cible atteinte en temps réel : ready=${liveReady}/${POOL_TARGET}`);
+            break;
+        }
+
+        const waveSize = Math.min(BUILD_CONCURRENCY, missing, BUILD_LIMIT - built);
+        console.log(`[deal-pool] stock réel=${liveReady}, manque=${missing}, vague=${waveSize}`);
+
+        const results = await Promise.allSettled(
+            Array.from({ length: waveSize }, () => buildRecordInWorker())
+        );
+
+        for (const result of results) {
+            if (result.status === 'fulfilled') {
+                const id = await publishRecord(result.value);
                 built++;
-                console.log(`[deal-pool] ${built}/${toBuild} publié ${id} (slot=${slot}, ${((Date.now() - t0) / 1000).toFixed(1)} s)`);
-            } catch (err) {
-                failures.push({ index, error: String(err && err.stack || err) });
-                console.error(`[deal-pool] échec calcul ${index + 1}/${toBuild} (slot=${slot}) :`, err && err.stack || err);
+                const nowReady = await readyCount();
+                console.log(`[deal-pool] publié ${id} — generated=${built}, ready=${nowReady}/${POOL_TARGET}`);
+            } else {
+                failures++;
+                console.error('[deal-pool] échec calcul :', result.reason && result.reason.stack || result.reason);
             }
         }
     }
 
-    await Promise.all(Array.from({ length: parallel }, (_, i) => workerLoop(i + 1)));
+    const after = await readyCount();
+    console.log(`[deal-pool] terminé : before=${before}, after=${after}, generated=${built}, failures=${failures}`);
 
-    const after = Number(await redisCommand(['LLEN', READY_KEY]) || 0);
-    console.log(`[deal-pool] terminé : before=${before}, after=${after}, added=${built}, failures=${failures.length}`);
-    if (failures.length) throw new Error(`${failures.length} calcul(s) de donne ont échoué`);
+    if (after < POOL_TARGET) {
+        throw new Error(`stock cible non atteint : ${after}/${POOL_TARGET} (plafond=${BUILD_LIMIT}, échecs=${failures})`);
+    }
 }
 
 if (isMainThread) {
