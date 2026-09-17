@@ -8,7 +8,7 @@ on:
         required: false
         default: "2000"
       batch:
-        description: "Plafond de donnes calculées pendant ce run (sécurité)"
+        description: "Plafond par runner pendant ce run (sécurité)"
         required: false
         default: "1000"
   schedule:
@@ -25,6 +25,11 @@ concurrency:
 
 jobs:
   fill:
+    name: fill-${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -36,11 +41,59 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build fully precomputed deals
+      - name: Drain urgent PLAY deals first
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          BRIDGE_PRIORITY_SHARD: "pool-${{ matrix.shard }}"
+          BRIDGE_PRIORITY_CONCURRENCY: "2"
+          BRIDGE_PRIORITY_MAX_JOBS_PER_WORKER: "8"
+        run: node scripts/process-priority-deals.js
+
+      - name: Build fully precomputed pool deals
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           BRIDGE_DEAL_POOL_TARGET: ${{ github.event.inputs.target || '2000' }}
           BRIDGE_DEAL_POOL_BUILD_BATCH: ${{ github.event.inputs.batch || '1000' }}
           BRIDGE_DEAL_POOL_BUILD_CONCURRENCY: "2"
+          # Chaque shard accepte une progression partielle. Le job verify ci-dessous
+          # décide une seule fois, après les 4 runners, si la cible globale est atteinte.
+          BRIDGE_DEAL_POOL_REQUIRE_TARGET: "0"
         run: node scripts/fill-deal-pool.js
+
+  verify:
+    name: verify-target
+    needs: fill
+    if: ${{ always() && needs.fill.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify READY target
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          BRIDGE_DEAL_POOL_TARGET: ${{ github.event.inputs.target || '2000' }}
+        run: |
+          node <<'NODE'
+          (async () => {
+            const url = process.env.UPSTASH_REDIS_REST_URL;
+            const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+            const target = Number(process.env.BRIDGE_DEAL_POOL_TARGET || 2000);
+            const resp = await fetch(url, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify(['LLEN', 'bridge-deal-pool:v3:ready'])
+            });
+            const body = await resp.json();
+            const ready = Number(body && body.result || 0);
+            console.log(`[deal-pool] vérification globale : ready=${ready}/${target}`);
+            if (!resp.ok || body.error) throw new Error(body.error || `Upstash HTTP ${resp.status}`);
+            if (ready < target) throw new Error(`stock cible non atteint : ${ready}/${target}`);
+          })().catch(err => { console.error(err); process.exit(1); });
+          NODE

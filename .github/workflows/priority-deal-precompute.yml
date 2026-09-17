@@ -1,0 +1,40 @@
+name: PLAY priority deal precompute
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Les requêtes rapprochées sont fusionnées naturellement : pendant qu'un run travaille,
+# les nouvelles donnes restent dans Redis et sont réclamées par les workers encore actifs.
+concurrency:
+  group: play-priority-deal-precompute
+  cancel-in-progress: false
+
+jobs:
+  compute:
+    name: priority-${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Precompute urgent PLAY deals
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          BRIDGE_PRIORITY_SHARD: "urgent-${{ matrix.shard }}"
+          BRIDGE_PRIORITY_CONCURRENCY: "2"
+          BRIDGE_PRIORITY_MAX_JOBS_PER_WORKER: "12"
+        run: node scripts/process-priority-deals.js

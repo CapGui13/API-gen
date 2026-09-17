@@ -1,18 +1,15 @@
-API-gen — Deal Pool cible LIVE 240
+API-gen — PLAY deal pool 2000 + calcul prioritaire
 
-Tu peux pousser ces fichiers pendant que le run actuel tourne.
+Stock générique :
+- cible = 2000 READY
+- 4 runners GitHub en parallèle
+- 2 workers DDS par runner
+- vérification finale de la cible
 
-IMPORTANT :
-- le run actuellement en cours a déjà checkout l'ancien commit ;
-- il continuera donc normalement avec l'ancien comportement ;
-- le nouveau code ne s'appliquera qu'au prochain run.
+Donnes fresh de PLAY :
+- queue Redis prioritaire
+- DD exact puis paliers 24 / 48 / 72 pour NS et EW
+- workflow GitHub séparé 4 runners x 2 workers
+- déclenchement instantané si BRIDGE_GITHUB_ACTIONS_TOKEN est configuré dans Vercel
 
-Nouveau comportement :
-- relit le stock READY réel après chaque vague ;
-- si PLAY consomme des donnes pendant la génération, le générateur continue ;
-- arrêt seulement quand READY >= target (240), ou si le plafond de sécurité est atteint ;
-- toujours 1 seul runner GitHub, concurrence interne = 2.
-
-Fichiers :
-- .github/workflows/deal-pool-precompute.yml
-- scripts/fill-deal-pool.js
+Voir README-DEAL-POOL.md pour la configuration.

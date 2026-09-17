@@ -33,6 +33,7 @@ const POOL_TARGET = clampInt(process.env.BRIDGE_DEAL_POOL_TARGET, 2000, 40, 2000
 const BUILD_LIMIT = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_BATCH, 1000, 1, 2000);
 const BUILD_CONCURRENCY = clampInt(process.env.BRIDGE_DEAL_POOL_BUILD_CONCURRENCY, 2, 1, 4);
 const SAMPLE_COUNT = 72;
+const REQUIRE_TARGET = String(process.env.BRIDGE_DEAL_POOL_REQUIRE_TARGET || '1') !== '0';
 
 const SEATS = ['N', 'E', 'S', 'W'];
 const SUITS = ['S', 'H', 'D', 'C'];
@@ -241,7 +242,9 @@ async function main() {
     console.log(`[deal-pool] terminé : before=${before}, after=${after}, generated=${built}, failures=${failures}`);
 
     if (after < POOL_TARGET) {
-        throw new Error(`stock cible non atteint : ${after}/${POOL_TARGET} (plafond=${BUILD_LIMIT}, échecs=${failures})`);
+        const message = `stock cible non atteint : ${after}/${POOL_TARGET} (plafond=${BUILD_LIMIT}, échecs=${failures})`;
+        if (REQUIRE_TARGET) throw new Error(message);
+        console.log(`[deal-pool] progression partielle acceptée sur ce shard : ${message}`);
     }
 }
 

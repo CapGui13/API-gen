@@ -1,0 +1,11 @@
+API-gen — 4 runners + queue prioritaire PLAY
+
+- stock cible 2000 conservé ;
+- workflow de remplissage : 4 runners en matrice, 2 workers DDS chacun ;
+- vérification finale READY >= target ;
+- nouvelle queue Redis pour les donnes fresh de PLAY ;
+- nouveau workflow prioritaire : 4 runners x 2 workers ;
+- publication progressive : DD exact, puis 24/48/72 pour NS et EW ;
+- endpoint Vercel : enqueue-precompute + precompute-status ;
+- déclenchement GitHub best-effort via BRIDGE_GITHUB_ACTIONS_TOKEN ;
+- fallback local PLAY inchangé si GitHub/Vercel indisponible.
