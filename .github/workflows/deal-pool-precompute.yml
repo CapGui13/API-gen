@@ -6,7 +6,7 @@ on:
       target:
         description: "Nombre de donnes READY visé"
         required: false
-        default: "240"
+        default: "2000"
       batch:
         description: "Plafond de donnes calculées pendant ce run (sécurité)"
         required: false
@@ -40,7 +40,7 @@ jobs:
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          BRIDGE_DEAL_POOL_TARGET: ${{ github.event.inputs.target || '240' }}
+          BRIDGE_DEAL_POOL_TARGET: ${{ github.event.inputs.target || '2000' }}
           BRIDGE_DEAL_POOL_BUILD_BATCH: ${{ github.event.inputs.batch || '1000' }}
           BRIDGE_DEAL_POOL_BUILD_CONCURRENCY: "2"
         run: node scripts/fill-deal-pool.js
