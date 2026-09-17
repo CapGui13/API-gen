@@ -35,6 +35,6 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           BRIDGE_PRIORITY_SHARD: "urgent-${{ matrix.shard }}"
-          BRIDGE_PRIORITY_CONCURRENCY: "2"
-          BRIDGE_PRIORITY_MAX_JOBS_PER_WORKER: "12"
-        run: node scripts/process-priority-deals.js
+          BRIDGE_PRIORITY_CONCURRENCY: "4"
+          BRIDGE_PRIORITY_MAX_TASKS_PER_WORKER: "96"
+        run: node scripts/process-priority-deals-sharded.js

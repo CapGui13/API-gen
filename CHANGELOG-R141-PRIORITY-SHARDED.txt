@@ -1,0 +1,12 @@
+R141 — Priority precompute sharded
+2026-09-17
+
+API-gen
+- 4 Worker Threads par runner (au lieu de 2).
+- 4 runners conservés pour mesurer proprement le gain avant un éventuel passage à 8.
+- Une donne fraîche est découpée en DD exact + 72 tâches sample indépendantes.
+- Les 16 threads GitHub peuvent collaborer sur une même donne.
+- Chaque sample calcule NS + EW puis publie dans Redis.
+- Checkpoints 24/48/72 assemblés et publiés dès que les préfixes sont complets.
+- Claims Redis avec TTL + requeue pour tolérer les tâches concurrentes/retards.
+- Compatibilité conservée avec l'API precompute-status existante (mêmes ddTable/precomputedStatV1/sampleCount/status).
